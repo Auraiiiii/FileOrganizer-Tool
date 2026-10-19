@@ -21,12 +21,11 @@
 
 ## 界面预览
 
-> **截图占位**
 >
-> ![软件截图]（https://raw.githubusercontent.com/Auraiiiii/FileOrganizer-Tool/f9864ec7ebd8780b7db1d90d2f345c8754a8a1f0/%E5%BE%AE%E4%BF%A1%E5%9B%BE%E7%89%87_20261019174719_4_1.png?token=CRYJ6B23GNOY37H2FFC6M63K2XUPM）
 >
-> 可使用 Markdown 图片语法：`![FileOrganizer-Tool 界面截图](docs/images/screenshot.png)`
-
+>![软件截图](screenshot.png)
+>
+> 
 ---
 
 ## 目录
