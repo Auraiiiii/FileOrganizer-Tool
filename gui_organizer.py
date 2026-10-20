@@ -942,6 +942,11 @@ def main() -> None:
 
     # 创建 tkinter 主窗口。
     root = tk.Tk()
+    # 设置窗口左上角图标；找不到图标时继续正常启动程序。
+    try:
+        root.iconbitmap("app_icon.ico")
+    except (tk.TclError, OSError):
+        pass
     # 使用较新的系统主题，让按钮和滚动条更接近系统样式。
     try:
         ttk.Style().theme_use("vista")
