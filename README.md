@@ -4,7 +4,9 @@
 
 **把混乱变成秩序，只需一次点击。**
 
-一款基于 Python + Tkinter 的本地文件整理工具：按类型归档、按修改月份归档，并为每一次整理保留一条安全的“后悔路”。
+一款基于 Python + Tkinter 的本地文件整理工具：支持 AI 智能重命名、按类型归档、按修改月份归档，并为每一次整理保留一条安全的“后悔路”。
+
+启用 AI 智能重命名后，程序会调用 DeepSeek 为 `.txt` 和 `.md` 文档生成简短摘要，并将摘要加入文件名；如果 AI 请求失败，会明确记录原因并自动回退到普通整理流程。
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Tkinter](https://img.shields.io/badge/GUI-Tkinter-3776AB?logo=python&logoColor=white)
@@ -21,11 +23,8 @@
 
 ## 界面预览
 
->
->
->![软件截图](screenshot.png)
->
-> 
+![软件截图](screenshot.png)
+
 ---
 
 ## 目录
