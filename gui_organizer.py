@@ -53,6 +53,26 @@ MODE_OPTIONS = (
     ("按修改时间分类", MODE_BY_TIME),
 )
 
+# 只有这两种纯文本格式适合把内容发送给摘要模型。
+AI_RENAME_SUFFIXES = {".txt", ".md"}
+# 按需求只读取每个文档最前面的 500 个字符，控制隐私范围和请求大小。
+AI_TEXT_PREVIEW_LENGTH = 500
+# 即使模型没有严格遵守提示词，也用这个上限控制最终文件名长度。
+AI_SUMMARY_MAX_CHARS = 10
+# Windows 文件名不允许这些字符；其他系统也可能因路径规则拒绝它们。
+INVALID_FILE_NAME_CHARS = frozenset('<>:"/\\|?*')
+
+
+def describe_exception(error: Exception) -> str:
+    """把异常转换成适合日志区显示的具体错误信息。"""
+
+    # 对 OpenAI API 错误保留 HTTP 状态码，方便判断鉴权、余额或服务端问题。
+    status_code = getattr(error, "status_code", None)
+    error_detail = str(error).strip() or repr(error)
+    if status_code is not None:
+        return f"{type(error).__name__}（HTTP {status_code}）：{error_detail}"
+    return f"{type(error).__name__}：{error_detail}"
+
 
 @dataclass(frozen=True)
 class MoveRecord:
@@ -110,6 +130,51 @@ def build_destination(target_directory: Path, file_name: str) -> Path:
         index += 1
 
 
+# 定义函数，把模型摘要转换成安全、简短且不会覆盖文件的名称。
+def build_ai_file_name(summary: str, original_path: Path) -> str:
+    """根据摘要生成 AI 重命名后的文件名。
+
+    摘要由远程模型生成，不能直接拼进路径。这里会合并空白、限制长度，
+    并把 Windows 不允许的字符替换成下划线，防止 create/rename 时崩溃。
+    """
+
+    # 合并换行和连续空格，避免摘要中包含不可控的多行文件名。
+    compact_summary = " ".join(summary.split()).strip()
+    # 逐字符过滤控制字符和文件系统保留字符。
+    safe_chars = []
+    for character in compact_summary:
+        if character in INVALID_FILE_NAME_CHARS or ord(character) < 32:
+            safe_chars.append("_")
+        else:
+            safe_chars.append(character)
+    # 去掉摘要首尾可能留下的空格、点和下划线。
+    safe_summary = "".join(safe_chars).strip(" ._")
+    # 模型偶尔会超过提示词要求的长度，程序侧再次截断以保证安全。
+    safe_summary = safe_summary[:AI_SUMMARY_MAX_CHARS].rstrip(" ._")
+
+    # 空摘要无法形成有意义的新文件名，通知调用方回退到原整理流程。
+    if not safe_summary:
+        raise ValueError("AI 摘要中没有可用于文件名的有效字符")
+
+    # 按需求保留原文件主名称，并统一生成 .txt 后缀。
+    # 例如 notes.md 和“项目计划”会变成 [项目计划]_notes.txt。
+    return f"[{safe_summary}]_{original_path.stem}.txt"
+
+
+# 定义函数，安全读取文档开头的一小段文本供 AI 总结。
+def read_ai_preview(file_path: Path) -> str:
+    """读取文本文件的前 500 个字符，无法解码的字节使用替换字符。"""
+
+    # 使用 utf-8-sig 兼容带 BOM 的文本文件；errors="replace" 让少量坏字符
+    # 不会阻止整个文件继续处理。read(500) 统计的是 Python 字符串字符数。
+    with file_path.open(
+        "r",
+        encoding="utf-8-sig",
+        errors="replace",
+    ) as source_file:
+        return source_file.read(AI_TEXT_PREVIEW_LENGTH)
+
+
 # 定义整理函数，接收要整理的文件夹路径、整理模式和日志回调函数。
 def organize_directory(
     source_directory: Path,
@@ -117,6 +182,7 @@ def organize_directory(
     log_callback=None,
     mode: str = MODE_BY_TYPE,
     move_records: list[MoveRecord] | None = None,
+    use_ai: bool = False,
 ) -> tuple[int, int]:
     """整理指定文件夹，并返回（成功数量，失败数量）。
 
@@ -125,6 +191,7 @@ def organize_directory(
     log_callback：接收日志文本的函数；传入 None 时不输出过程信息。
     mode：整理模式，MODE_BY_TYPE 表示按类型，MODE_BY_TIME 表示按修改月份。
     move_records：用于收集成功移动记录的列表，供“撤销上一步”使用。
+    use_ai：为 True 时尝试为 .txt/.md 文件生成 AI 摘要并重命名。
     """
 
     # 如果没有提供日志函数，就使用一个什么都不做的小函数。
@@ -148,8 +215,35 @@ def organize_directory(
     # 初始化找到的可整理文件数量。
     found_count = 0
 
-    # 遍历所选文件夹中的每一个项目，只处理最外层，不进入子文件夹。
-    for file_path in source_directory.iterdir():
+    # 下面的计数会写入日志，确保用户能确认 AI 是否真正执行过。
+    ai_eligible_count = 0
+    ai_attempted_count = 0
+    ai_success_count = 0
+    ai_failure_count = 0
+
+    # AI 模块采用延迟导入：只有用户勾选 AI 功能时才加载第三方依赖。
+    summarize_text = None
+    ai_unavailable_reason = ""
+    if use_ai:
+        try:
+            from ai_renamer import summarize_text as imported_summarize_text
+            import ai_renamer
+
+            summarize_text = imported_summarize_text
+            # 每次启用 AI 时都打印配置诊断，明确实际读取的 .env 路径、
+            # Key 是否存在以及依赖和客户端的状态，且不会泄露密钥内容。
+            log_callback(f"AI 配置诊断：{ai_renamer.get_ai_diagnostics()}")
+        except Exception as error:
+            # 模块导入或诊断初始化失败时保留完整异常类型和消息。
+            ai_unavailable_reason = describe_exception(error)
+            log_callback(
+                f"AI 初始化失败：{ai_unavailable_reason}。"
+                "本次将按普通方式整理文件。"
+            )
+
+    # 先复制一份顶层文件列表再遍历；AI 重命名会改变目录项名称，
+    # 使用快照可以避免边遍历边修改目录造成漏处理文件。
+    for file_path in list(source_directory.iterdir()):
         # 如果当前项目不是文件，就跳过文件夹、快捷方式等非普通文件。
         if not file_path.is_file():
             continue
@@ -171,20 +265,75 @@ def organize_directory(
 
         # 使用异常处理，避免单个文件失败后中断整个整理任务。
         try:
+            # current_path 会随着 AI 重命名而变化；API 失败时仍指向原文件。
+            current_path = file_path
+
+            # 判断当前文件是否属于 AI 允许处理的纯文本格式。
+            is_ai_document = (
+                current_path.suffix.lower() in AI_RENAME_SUFFIXES
+            )
+
+            # 仅对勾选 AI 时的 .txt 和 .md 文档执行摘要与重命名。
+            if use_ai and is_ai_document:
+                ai_eligible_count += 1
+
+                # 模块不可用也必须为每个符合条件的文件写明原因。
+                if summarize_text is None:
+                    ai_failure_count += 1
+                    reason = ai_unavailable_reason or "AI 模块未成功加载"
+                    log_callback(
+                        f"AI 重命名跳过：{file_path.name}。"
+                        f"具体原因：{reason}。文件将按普通方式整理。"
+                    )
+                else:
+                    ai_attempted_count += 1
+                    try:
+                        # 只读取前 500 个字符，避免读取大文件或发送过多隐私内容。
+                        preview = read_ai_preview(current_path)
+                        # 网络请求在后台整理线程中执行，因此不会冻结 tkinter 界面。
+                        summary = summarize_text(preview)
+                        # 把模型摘要清洗成安全的文件名。
+                        ai_file_name = build_ai_file_name(summary, current_path)
+                        # 在原文件夹中处理重名冲突，确保不会覆盖已有文件。
+                        ai_renamed_path = build_destination(
+                            source_directory,
+                            ai_file_name,
+                        )
+                        # 按需求先在原位置重命名，再进入统一的分类移动流程。
+                        current_path.rename(ai_renamed_path)
+                        # 保留用户要求的重命名日志格式。
+                        log_callback(
+                            f"AI 已重命名: {file_path.name} -> "
+                            f"{ai_renamed_path.name}"
+                        )
+                        # 后续分类和移动都基于 AI 重命名后的实际路径。
+                        current_path = ai_renamed_path
+                        ai_success_count += 1
+                    except Exception as error:
+                        # 鉴权失败、余额不足、无网络、超时、空摘要等都在这里记录。
+                        # 错误日志包含异常类型、消息和 HTTP 状态码，然后明确回退。
+                        ai_failure_count += 1
+                        reason = describe_exception(error)
+                        log_callback(
+                            f"AI 重命名失败：{file_path.name}。"
+                            f"具体原因：{reason}。文件将按普通方式整理。"
+                        )
+                        current_path = file_path
+
             # 根据用户选择的模式决定分类文件夹名称。
             if mode == MODE_BY_TIME:
-                category = get_month_category(file_path)
+                category = get_month_category(current_path)
             else:
-                category = get_category(file_path)
+                category = get_category(current_path)
 
             # 拼接分类文件夹的完整路径。
             target_directory = source_directory / category
             # 创建分类文件夹；如果文件夹已经存在，不会报错。
             target_directory.mkdir(parents=True, exist_ok=True)
             # 计算不会覆盖已有文件的目标路径。
-            destination = build_destination(target_directory, file_path.name)
+            destination = build_destination(target_directory, current_path.name)
             # 把当前文件从原位置移动到分类文件夹中。
-            shutil.move(str(file_path), str(destination))
+            shutil.move(str(current_path), str(destination))
             # 只有移动成功后，才保存撤销所需的原始路径和目标路径。
             move_records.append(
                 MoveRecord(
@@ -193,19 +342,32 @@ def organize_directory(
                 )
             )
             # 把本次移动结果写入日志。
-            log_callback(f"已移动：{file_path.name} -> {category}/")
+            log_callback(f"已移动：{current_path.name} -> {category}/")
             # 成功移动后，把成功数量加一。
             moved_count += 1
         # 捕获文件移动过程中可能出现的系统或权限错误。
         except OSError as error:
             # 输出失败原因，但不终止其他文件的整理。
-            log_callback(f"移动失败：{file_path.name}（{error}）")
+            log_callback(f"移动失败：{current_path.name}（{error}）")
             # 移动失败后，把失败数量加一。
             failed_count += 1
 
     # 如果没有任何可整理的文件，就给出明确提示。
     if found_count == 0:
         log_callback("没有找到需要整理的文件。")
+
+    # AI 统计能给用户一个明确结论，避免“看起来没有执行”却不知道原因。
+    if use_ai:
+        if ai_eligible_count == 0:
+            log_callback(
+                "AI 重命名未执行：所选文件夹顶层没有 .txt 或 .md 文件。"
+            )
+        log_callback(
+            f"AI 重命名统计：符合条件的文件 {ai_eligible_count} 个，"
+            f"AI 调用尝试 {ai_attempted_count} 个，成功 {ai_success_count} 个，"
+            f"失败 {ai_failure_count} 个。"
+        )
+
     # 所有文件处理完成后，输出简短的结果摘要。
     log_callback(
         f"整理完成：成功移动了 {moved_count} 个文件，失败 {failed_count} 个文件。"
@@ -309,6 +471,8 @@ class OrganizerApp:
         self.folder_path = tk.StringVar()
         # 保存下拉菜单的当前选项。
         self.selected_mode = tk.StringVar(value=MODE_OPTIONS[0][0])
+        # 保存 AI 复选框状态；默认关闭，避免普通整理也发起网络请求。
+        self.use_ai = tk.BooleanVar(value=False)
         # 创建一个线程安全队列，用来接收后台线程发来的日志。
         self.message_queue: queue.Queue = queue.Queue()
         # 记录当前是否正在整理或撤销，防止重复点击。
@@ -424,7 +588,7 @@ class OrganizerApp:
         mode_frame = tk.Frame(main_frame, bg=self.BACKGROUND_COLOR)
         # 让整理方式区域横向铺满，并在上方留出间距。
         mode_frame.grid(row=3, column=0, sticky="ew", pady=(14, 0))
-        # 让右侧提示文字能够占据剩余宽度。
+        # 让右侧 AI 复选框能够占据剩余宽度。
         mode_frame.columnconfigure(2, weight=1)
 
         # 创建“整理方式”标签。
@@ -450,6 +614,28 @@ class OrganizerApp:
         # 把下拉菜单放在标签右侧。
         self.mode_combo.grid(row=0, column=1, sticky="w", ipady=3)
 
+        # 创建 AI 智能重命名复选框，并将它与整理方式放在同一行。
+        # BooleanVar 会把勾选状态转换成 True/False，点击整理时固定本次取值。
+        self.ai_checkbox = tk.Checkbutton(
+            mode_frame,
+            text="是否使用 AI 智能重命名文档 (极慢)",
+            variable=self.use_ai,
+            font=("Microsoft YaHei UI", 10),
+            bg=self.BACKGROUND_COLOR,
+            fg=self.TEXT_COLOR,
+            activebackground=self.BACKGROUND_COLOR,
+            activeforeground=self.TEXT_COLOR,
+            selectcolor="#ffffff",
+            anchor="w",
+        )
+        # 把复选框放在下拉菜单右侧，并留出一点间距。
+        self.ai_checkbox.grid(
+            row=0,
+            column=2,
+            sticky="w",
+            padx=(18, 0),
+        )
+
         # 创建一条提示，说明按修改时间整理会生成什么样的文件夹。
         mode_hint = tk.Label(
             mode_frame,
@@ -459,8 +645,14 @@ class OrganizerApp:
             fg=self.MUTED_COLOR,
             anchor="e",
         )
-        # 把提示放在下拉菜单右侧，并靠右对齐。
-        mode_hint.grid(row=0, column=2, sticky="e", padx=(12, 0))
+        # 第二行提示可以避免长复选框文字导致窗口横向溢出。
+        mode_hint.grid(
+            row=1,
+            column=1,
+            columnspan=2,
+            sticky="e",
+            pady=(6, 0),
+        )
 
         # 创建“开始整理”按钮。
         self.start_button = tk.Button(
@@ -616,6 +808,8 @@ class OrganizerApp:
             self.path_entry.configure(state="disabled")
             self.browse_button.configure(state="disabled")
             self.mode_combo.configure(state="disabled")
+            # 任务开始后不再允许改变 AI 开关，保证整个批次行为一致。
+            self.ai_checkbox.configure(state="disabled")
             return
 
         # 后台任务结束后，恢复所有输入控件的可用状态。
@@ -628,6 +822,8 @@ class OrganizerApp:
         self.path_entry.configure(state="normal")
         self.browse_button.configure(state="normal")
         self.mode_combo.configure(state="readonly")
+        # 任务结束后重新允许用户选择是否使用 AI。
+        self.ai_checkbox.configure(state="normal")
         # 根据是否还有撤销记录决定撤销按钮是否可用。
         self._update_undo_button()
 
@@ -675,6 +871,8 @@ class OrganizerApp:
 
         # 在点击时固定本次使用的整理模式，避免后台运行期间选项变化。
         mode = self._selected_mode()
+        # 同样固定 AI 开关状态，避免后台线程读到随后变化的界面变量。
+        use_ai = self.use_ai.get()
         # 记录用户选择的模式名称，方便日志阅读。
         mode_label = self.selected_mode.get()
 
@@ -683,13 +881,18 @@ class OrganizerApp:
         # 记录本次整理的文件夹和整理方式。
         self._append_log(f"开始整理：{source_directory}")
         self._append_log(f"整理方式：{mode_label}")
+        self._append_log(
+            "AI 智能重命名：已启用（仅处理 .txt 和 .md）"
+            if use_ai
+            else "AI 智能重命名：未启用"
+        )
         # 标记程序正在执行后台任务，并禁用相关控件。
         self._set_busy(True, "正在整理…")
 
         # 创建后台线程，把耗时的文件移动操作放到界面线程之外。
         worker = threading.Thread(
             target=self._organize_in_background,
-            args=(source_directory, mode),
+            args=(source_directory, mode, use_ai),
             daemon=True,
         )
         # 启动后台线程。
@@ -697,7 +900,12 @@ class OrganizerApp:
         # 开始定期检查后台线程发来的日志。
         self.root.after(100, self._process_messages)
 
-    def _organize_in_background(self, source_directory: Path, mode: str) -> None:
+    def _organize_in_background(
+        self,
+        source_directory: Path,
+        mode: str,
+        use_ai: bool,
+    ) -> None:
         """在后台线程中执行整理，并通过队列把消息传回界面。"""
 
         # 把日志函数包装成“把消息放进队列”的函数。
@@ -716,10 +924,14 @@ class OrganizerApp:
                 skip_paths={
                     Path(__file__),
                     Path(__file__).resolve().with_name("organizer.py"),
+                    # AI 模块和密钥配置也是程序运行依赖，整理项目目录时不能移走。
+                    Path(__file__).resolve().with_name("ai_renamer.py"),
+                    Path(__file__).resolve().with_name(".env"),
                 },
                 log_callback=send_log,
                 mode=mode,
                 move_records=move_records,
+                use_ai=use_ai,
             )
             # 把整理结果和移动记录一起发送给界面线程。
             self.message_queue.put(
