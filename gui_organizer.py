@@ -61,6 +61,75 @@ AI_TEXT_PREVIEW_LENGTH = 500
 AI_SUMMARY_MAX_CHARS = 10
 # Windows 文件名不允许这些字符；其他系统也可能因路径规则拒绝它们。
 INVALID_FILE_NAME_CHARS = frozenset('<>:"/\\|?*')
+# API Key 配置与 AI 模块使用同一个 .env 文件。
+ENV_FILE = Path(__file__).resolve().with_name(".env")
+# .env 中保存 DeepSeek API Key 的变量名。
+API_KEY_ENV_NAME = "DEEPSEEK_API_KEY"
+# 界面中用于隐藏已保存 Key 的占位文字。
+API_KEY_MASK = "********"
+
+
+def env_has_api_key(env_file: Path = ENV_FILE) -> bool:
+    """检查 .env 中是否配置了非空的 DEEPSEEK_API_KEY。"""
+
+    try:
+        env_lines = env_file.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        # 文件不存在或无法读取时按未配置处理，不把异常带到启动界面。
+        return False
+
+    for line in env_lines:
+        stripped_line = line.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+        if stripped_line.startswith("export "):
+            stripped_line = stripped_line[len("export ") :].lstrip()
+        variable_name, separator, value = stripped_line.partition("=")
+        if separator and variable_name.strip() == API_KEY_ENV_NAME:
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1].strip()
+            return bool(value)
+    return False
+
+
+def write_api_key_to_env(api_key: str, env_file: Path = ENV_FILE) -> None:
+    """把 API Key 写入 .env，同时保留文件中的其他配置项。"""
+
+    if "\n" in api_key or "\r" in api_key:
+        raise ValueError("API Key 不能包含换行符")
+
+    try:
+        old_lines = env_file.read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        old_lines = []
+
+    updated_lines: list[str] = []
+    key_replaced = False
+    for line in old_lines:
+        stripped_line = line.strip()
+        assignment_line = (
+            stripped_line[len("export ") :].lstrip()
+            if stripped_line.startswith("export ")
+            else stripped_line
+        )
+        variable_name, separator, _ = assignment_line.partition("=")
+        if (
+            not stripped_line.startswith("#")
+            and separator
+            and variable_name.strip() == API_KEY_ENV_NAME
+        ):
+            # 如果 .env 中已有重复配置，只保留一条最新的 Key。
+            if not key_replaced:
+                updated_lines.append(f"{API_KEY_ENV_NAME}={api_key}")
+                key_replaced = True
+            continue
+        updated_lines.append(line)
+
+    if not key_replaced:
+        updated_lines.append(f"{API_KEY_ENV_NAME}={api_key}")
+
+    env_file.write_text("\n".join(updated_lines).rstrip("\n") + "\n", encoding="utf-8")
 
 
 def describe_exception(error: Exception) -> str:
@@ -229,7 +298,13 @@ def organize_directory(
             from ai_renamer import summarize_text as imported_summarize_text
             import ai_renamer
 
-            summarize_text = imported_summarize_text
+            # 在整理开始前重新读取当前配置，明确区分“缺少 Key”和依赖问题。
+            ai_renamer.reload_ai_configuration()
+            if not ai_renamer.is_api_key_configured():
+                ai_unavailable_reason = "请先配置 API Key"
+                log_callback("请先配置 API Key")
+            else:
+                summarize_text = imported_summarize_text
             # 每次启用 AI 时都打印配置诊断，明确实际读取的 .env 路径、
             # Key 是否存在以及依赖和客户端的状态，且不会泄露密钥内容。
             log_callback(f"AI 配置诊断：{ai_renamer.get_ai_diagnostics()}")
@@ -463,6 +538,8 @@ class OrganizerApp:
     ACCENT_ACTIVE_COLOR = "#1d4ed8"
     # 设置次要按钮的按下背景颜色。
     SECONDARY_ACTIVE_COLOR = "#eff6ff"
+    # 设置已配置状态的提示颜色。
+    SUCCESS_COLOR = "#15803d"
 
     def __init__(self, root: tk.Tk) -> None:
         # 保存主窗口对象。
@@ -473,6 +550,10 @@ class OrganizerApp:
         self.selected_mode = tk.StringVar(value=MODE_OPTIONS[0][0])
         # 保存 AI 复选框状态；默认关闭，避免普通整理也发起网络请求。
         self.use_ai = tk.BooleanVar(value=False)
+        # 保存 API Key 输入框内容；已配置时只显示掩码，不回填真实 Key。
+        self.api_key = tk.StringVar()
+        # 记录界面上次读取或保存后，.env 中是否已经有 Key。
+        self.api_key_configured = False
         # 创建一个线程安全队列，用来接收后台线程发来的日志。
         self.message_queue: queue.Queue = queue.Queue()
         # 记录当前是否正在整理或撤销，防止重复点击。
@@ -483,9 +564,9 @@ class OrganizerApp:
         # 设置窗口标题。
         self.root.title("文件整理助手")
         # 设置窗口初始大小，为新增的下拉菜单和撤销按钮留出空间。
-        self.root.geometry("820x660")
+        self.root.geometry("820x720")
         # 设置窗口最小尺寸，避免控件被挤得过小。
-        self.root.minsize(680, 560)
+        self.root.minsize(680, 620)
         # 设置窗口背景颜色。
         self.root.configure(bg=self.BACKGROUND_COLOR)
 
@@ -513,14 +594,16 @@ class OrganizerApp:
         main_frame.rowconfigure(2, weight=0)
         # 设置第四行（整理方式）按内容高度显示。
         main_frame.rowconfigure(3, weight=0)
-        # 设置第五行（开始按钮）按内容高度显示。
+        # 设置第五行（API Key 配置）按内容高度显示。
         main_frame.rowconfigure(4, weight=0)
-        # 设置第六行（日志标题）按内容高度显示。
+        # 设置第六行（开始按钮）按内容高度显示。
         main_frame.rowconfigure(5, weight=0)
-        # 设置第七行（日志框）占据剩余空间。
-        main_frame.rowconfigure(6, weight=1)
-        # 设置第八行（撤销按钮）按内容高度显示。
-        main_frame.rowconfigure(7, weight=0)
+        # 设置第七行（日志标题）按内容高度显示。
+        main_frame.rowconfigure(6, weight=0)
+        # 设置第八行（日志框）占据剩余空间。
+        main_frame.rowconfigure(7, weight=1)
+        # 设置第九行（撤销按钮）按内容高度显示。
+        main_frame.rowconfigure(8, weight=0)
         # 让内容能够随窗口宽度伸缩。
         main_frame.columnconfigure(0, weight=1)
 
@@ -654,6 +737,60 @@ class OrganizerApp:
             pady=(6, 0),
         )
 
+        # 创建 API Key 配置区域，让用户不需要手动编辑 .env。
+        api_frame = tk.Frame(main_frame, bg=self.BACKGROUND_COLOR)
+        # 让 Key 输入框占据剩余宽度。
+        api_frame.columnconfigure(1, weight=1)
+        # 在整理方式下方留出间距。
+        api_frame.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+
+        # 创建 Key 输入框前的说明标签。
+        api_label = tk.Label(
+            api_frame,
+            text="API Key",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            bg=self.BACKGROUND_COLOR,
+            fg=self.TEXT_COLOR,
+        )
+        api_label.grid(row=0, column=0, sticky="w", padx=(0, 12))
+
+        # 输入框始终隐藏真实字符，避免 Key 在界面中明文显示。
+        self.api_key_entry = ttk.Entry(
+            api_frame,
+            textvariable=self.api_key,
+            show="*",
+            font=("Microsoft YaHei UI", 11),
+        )
+        self.api_key_entry.grid(row=0, column=1, sticky="ew", ipady=5)
+
+        # 保存按钮只负责写入当前目录的 .env，不发起网络请求。
+        self.save_api_key_button = ttk.Button(
+            api_frame,
+            text="保存 Key",
+            command=self._save_api_key,
+        )
+        self.save_api_key_button.grid(row=0, column=2, padx=(10, 0), ipady=3)
+
+        # 状态提示紧邻输入框，让用户确认启动时是否读取到 Key。
+        self.api_key_status_label = tk.Label(
+            api_frame,
+            text="",
+            font=("Microsoft YaHei UI", 9),
+            bg=self.BACKGROUND_COLOR,
+            fg=self.MUTED_COLOR,
+            anchor="w",
+        )
+        self.api_key_status_label.grid(
+            row=0,
+            column=3,
+            sticky="w",
+            padx=(12, 0),
+        )
+
+        # 已配置时聚焦输入框会自动选中掩码，直接输入即可覆盖。
+        self.api_key_entry.bind("<FocusIn>", self._prepare_api_key_edit)
+        self._refresh_api_key_status()
+
         # 创建“开始整理”按钮。
         self.start_button = tk.Button(
             main_frame,
@@ -671,7 +808,7 @@ class OrganizerApp:
             pady=12,
         )
         # 让按钮横向铺满，并在上下留出间距。
-        self.start_button.grid(row=4, column=0, sticky="ew", pady=(18, 20))
+        self.start_button.grid(row=5, column=0, sticky="ew", pady=(18, 20))
 
         # 创建“整理日志”标题。
         log_title = tk.Label(
@@ -683,12 +820,12 @@ class OrganizerApp:
             anchor="w",
         )
         # 把日志标题放在日志框上方。
-        log_title.grid(row=5, column=0, sticky="w", pady=(0, 8))
+        log_title.grid(row=6, column=0, sticky="w", pady=(0, 8))
 
         # 创建日志区域的外框。
         log_frame = tk.Frame(main_frame, bg="#d1d5db", padx=1, pady=1)
         # 让日志区域占据剩余的垂直空间。
-        log_frame.grid(row=6, column=0, sticky="nsew")
+        log_frame.grid(row=7, column=0, sticky="nsew")
         # 让文本框能够自动伸缩。
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
@@ -739,7 +876,7 @@ class OrganizerApp:
             state="disabled",
         )
         # 让撤销按钮横向铺满，并与日志区域拉开一点距离。
-        self.undo_button.grid(row=7, column=0, sticky="ew", pady=(14, 0))
+        self.undo_button.grid(row=8, column=0, sticky="ew", pady=(14, 0))
 
         # 在程序启动时显示欢迎提示。
         self._append_log("请选择文件夹和整理方式，然后点击“开始整理”。")
@@ -751,6 +888,92 @@ class OrganizerApp:
         self.path_entry.bind("<Return>", lambda event: self._start_organizing())
         # 初始化时没有撤销记录，让撤销按钮保持禁用样式。
         self._update_undo_button()
+
+    def _refresh_api_key_status(self) -> None:
+        """根据当前 .env 更新 Key 输入框和状态提示。"""
+
+        self.api_key_configured = env_has_api_key()
+        if self.api_key_configured:
+            # 只显示固定长度的掩码，不把真实 Key 放进 Tk 变量。
+            self.api_key.set(API_KEY_MASK)
+            self.api_key_status_label.configure(
+                text="API Key 已配置",
+                fg=self.SUCCESS_COLOR,
+            )
+        else:
+            if self.api_key.get() == API_KEY_MASK:
+                self.api_key.set("")
+            self.api_key_status_label.configure(
+                text="API Key 未配置",
+                fg=self.MUTED_COLOR,
+            )
+
+    def _prepare_api_key_edit(self, _event: tk.Event) -> None:
+        """双击或聚焦已配置的掩码时，自动全选以便直接输入新 Key。"""
+
+        if self.api_key.get() == API_KEY_MASK:
+            # 等 Entry 的默认点击处理完成后再选中，避免光标点击清掉选区。
+            self.root.after_idle(self._select_api_key_mask)
+
+    def _select_api_key_mask(self) -> None:
+        """选中 Key 掩码，用户键入的第一个字符会直接替换它。"""
+
+        if self.api_key.get() == API_KEY_MASK:
+            self.api_key_entry.selection_range(0, "end")
+            self.api_key_entry.icursor("end")
+
+    def _save_api_key(self) -> None:
+        """把输入框中的新 Key 保存到 .env。"""
+
+        if self.is_running:
+            return
+
+        api_key = self.api_key.get().strip()
+        if api_key == API_KEY_MASK:
+            self._refresh_api_key_status()
+            if self.api_key_configured:
+                messagebox.showinfo(
+                    "保存成功",
+                    "API Key 已配置，无需重复保存。",
+                    parent=self.root,
+                )
+            else:
+                self.api_key.set("")
+                messagebox.showwarning(
+                    "API Key 为空",
+                    "请先填写 API Key。",
+                    parent=self.root,
+                )
+                self.api_key_entry.focus_set()
+            return
+
+        if not api_key:
+            messagebox.showwarning(
+                "API Key 为空",
+                "请先填写 API Key。",
+                parent=self.root,
+            )
+            self.api_key_entry.focus_set()
+            return
+
+        try:
+            write_api_key_to_env(api_key)
+        except (OSError, ValueError) as error:
+            messagebox.showerror(
+                "保存失败",
+                f"无法保存 API Key：\n{error}",
+                parent=self.root,
+            )
+            return
+
+        # 保存后立即隐藏真实 Key，并提示下次 AI 调用会自动重新加载配置。
+        self._refresh_api_key_status()
+        self._append_log("API Key 已保存，将在下一次 AI 调用前自动加载。")
+        messagebox.showinfo(
+            "保存成功",
+            "API Key 已保存。",
+            parent=self.root,
+        )
 
     def _choose_folder(self) -> None:
         """打开系统文件夹选择窗口。"""
@@ -808,6 +1031,8 @@ class OrganizerApp:
             self.path_entry.configure(state="disabled")
             self.browse_button.configure(state="disabled")
             self.mode_combo.configure(state="disabled")
+            self.api_key_entry.configure(state="disabled")
+            self.save_api_key_button.configure(state="disabled")
             # 任务开始后不再允许改变 AI 开关，保证整个批次行为一致。
             self.ai_checkbox.configure(state="disabled")
             return
@@ -822,6 +1047,8 @@ class OrganizerApp:
         self.path_entry.configure(state="normal")
         self.browse_button.configure(state="normal")
         self.mode_combo.configure(state="readonly")
+        self.api_key_entry.configure(state="normal")
+        self.save_api_key_button.configure(state="normal")
         # 任务结束后重新允许用户选择是否使用 AI。
         self.ai_checkbox.configure(state="normal")
         # 根据是否还有撤销记录决定撤销按钮是否可用。

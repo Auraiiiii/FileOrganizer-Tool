@@ -9,8 +9,6 @@
 # 延迟解析类型注解，兼容较旧版本的 Python。
 from __future__ import annotations
 
-# 导入 os，用来从环境变量中读取 API Key。
-import os
 # 导入 Path，用来定位与当前模块放在同一目录下的 .env 文件。
 from pathlib import Path
 
@@ -24,13 +22,13 @@ ENV_FILE = Path(__file__).resolve().with_name(".env")
 
 # 第三方依赖采用容错导入。缺少某个包时仍允许本模块被导入，
 # 这样 GUI 就能在日志中显示具体缺少哪个包，而不是只看到一个导入失败。
-load_dotenv = None
+dotenv_values = None
 OpenAI = None
 _dependency_errors: list[str] = []
 
 try:
-    # 导入 dotenv 提供的配置加载函数。
-    from dotenv import load_dotenv
+    # 每次直接解析 .env 内容，避免使用环境变量中可能残留的旧 Key。
+    from dotenv import dotenv_values
 except ImportError as error:
     _dependency_errors.append(
         f"python-dotenv 未安装或无法导入（{type(error).__name__}: {error}）"
@@ -50,52 +48,85 @@ SYSTEM_PROMPT = (
     "不要标点，不要废话"
 )
 
-# 保存 .env 的加载错误，诊断日志会在不泄露密钥的前提下显示具体原因。
-_dotenv_load_error: str | None = None
+# 配置在每次 AI 调用前重新读取，这里只保存最近一次读取的结果。
+_api_key: str | None = None
+client: OpenAI | None = None
 
-# 只有依赖可用时才读取 .env；加载时不会覆盖操作系统中已有的同名变量。
-if load_dotenv is not None:
+# 保存最近一次 .env 加载和客户端初始化错误，方便调用方显示具体配置问题。
+_dotenv_load_error: str | None = None
+_client_init_error: str | None = None
+
+
+def reload_ai_configuration() -> bool:
+    """重新读取 .env 并重建 AI 客户端。
+
+    Returns:
+        AI 客户端是否已成功初始化。调用方可以先通过
+        ``is_api_key_configured`` 区分“未配置 Key”和“依赖不可用”。
+    """
+
+    global _api_key, client, _dotenv_load_error, _client_init_error
+
+    # 先清空上一次的配置，确保删除或更换 Key 后不会继续使用旧客户端。
+    _api_key = None
+    client = None
+    _dotenv_load_error = None
+    _client_init_error = None
+
+    if dotenv_values is None:
+        return False
+
     try:
-        load_dotenv(dotenv_path=ENV_FILE, override=False)
+        # 直接解析当前文件，而不是仅加载一次到 os.environ。
+        env_values = dotenv_values(dotenv_path=ENV_FILE)
+        raw_api_key = env_values.get("DEEPSEEK_API_KEY")
+        _api_key = (
+            str(raw_api_key).strip()
+            if raw_api_key is not None and str(raw_api_key).strip()
+            else None
+        )
     except Exception as error:
         _dotenv_load_error = (
             f"{type(error).__name__}: {str(error).strip() or repr(error)}"
         )
+        return False
 
-# 从环境变量中读取密钥；没有配置时保留 None，交由 summarize_text 给出清晰错误。
-_api_key = os.getenv("DEEPSEEK_API_KEY")
+    # 只有依赖和密钥都可用时才创建新的客户端。
+    if OpenAI is not None and _api_key:
+        try:
+            client = OpenAI(
+                api_key=_api_key,
+                base_url=DEEPSEEK_BASE_URL,
+                # 限制单次请求的等待时间，防止无网络时后台任务长时间挂起。
+                timeout=30.0,
+                # 只重试一次，兼顾偶发网络波动和界面响应速度。
+                max_retries=1,
+            )
+        except Exception as error:
+            _client_init_error = (
+                f"{type(error).__name__}: {str(error).strip() or repr(error)}"
+            )
 
-# 客户端声明为可能为空，便于在缺少密钥时仍然安全导入本模块。
-client: OpenAI | None = None
+    return client is not None
 
-# 保存客户端初始化错误，方便调用方在日志中显示具体配置问题。
-_client_init_error: str | None = None
 
-# 只有依赖和密钥都可用时才创建客户端。
-if OpenAI is not None and _api_key:
-    try:
-        client = OpenAI(
-            api_key=_api_key,
-            base_url=DEEPSEEK_BASE_URL,
-            # 限制单次请求的等待时间，防止无网络时后台任务长时间挂起。
-            timeout=30.0,
-            # 只重试一次，兼顾偶发网络波动和界面响应速度。
-            max_retries=1,
-        )
-    except Exception as error:
-        _client_init_error = (
-            f"{type(error).__name__}: {str(error).strip() or repr(error)}"
-        )
+def is_api_key_configured() -> bool:
+    """返回最近一次重新加载后是否从 .env 中读到了非空 Key。"""
+
+    return bool(_api_key)
 
 
 def get_ai_diagnostics() -> str:
-    """返回不含密钥内容的 AI 配置诊断信息。"""
+    """重新加载配置，并返回不含密钥内容的 AI 诊断信息。"""
+
+    # 诊断时也重新读取文件，确保显示的是当前 .env 的真实状态。
+    reload_ai_configuration()
 
     # 只报告 .env 是否存在以及 Key 是否读取成功，绝不输出密钥本身。
     env_state = "存在" if ENV_FILE.is_file() else "不存在"
     if _api_key:
         key_state = "已读取"
-    elif load_dotenv is None:
+    elif dotenv_values is None:
         key_state = "未读取（python-dotenv 不可用）"
     elif not ENV_FILE.is_file():
         key_state = "未找到（.env 不存在）"
@@ -128,7 +159,7 @@ def summarize_text(text: str) -> str:
         模型返回的摘要字符串，已去掉首尾空白并合并多余换行。
 
     Raises:
-        RuntimeError: 没有配置 DEEPSEEK_API_KEY 时抛出。
+        RuntimeError: 没有配置 DEEPSEEK_API_KEY 或客户端不可用时抛出。
         ValueError: 输入为空或模型返回空摘要时抛出。
         其他异常: OpenAI SDK 会把网络错误、鉴权失败、余额不足等向上抛出，
             由 GUI 捕获并回退到普通整理流程。
@@ -138,10 +169,16 @@ def summarize_text(text: str) -> str:
     if not text or not text.strip():
         raise ValueError("没有可供 AI 总结的文本内容")
 
-    # 缺少密钥通常是配置问题；错误中包含 .env 绝对路径和具体依赖状态。
+    # 每次真正调用 AI 前都重新读取 .env，让刚保存的 Key 立即生效。
+    reload_ai_configuration()
+
+    if not _api_key:
+        raise RuntimeError("请先配置 API Key")
+
+    # 缺少依赖或客户端初始化失败时，错误中包含具体诊断状态。
     if client is None:
         raise RuntimeError(
-            "AI 客户端不可用，请检查依赖、.env 和 DEEPSEEK_API_KEY。"
+            "AI 客户端不可用，请检查依赖和 API Key 配置。"
             f"诊断信息：{get_ai_diagnostics()}"
         )
 
