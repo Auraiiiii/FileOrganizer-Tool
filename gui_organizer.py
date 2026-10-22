@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """文件整理助手（图形界面版）。
 
-这个程序使用 Python 自带的 tkinter 库，为原有的 organizer.py 加上图形界面。
+这个程序使用 customtkinter 构建轻量、现代的桌面图形界面。
 它保留下面的整理逻辑：
 1. 只整理所选文件夹顶层的文件，不会递归进入子文件夹。
 2. 支持按扩展名分类，以及按文件修改月份归档两种整理方式。
@@ -20,14 +20,16 @@ import shutil
 import threading
 # 导入 tkinter，它是 Python 自带的图形界面库。
 import tkinter as tk
+# 导入 customtkinter，用圆角卡片和现代控件替换传统原生外观。
+import customtkinter as ctk
 # 从 dataclasses 中导入 dataclass，用来保存每一次文件移动记录。
 from dataclasses import dataclass
 # 从 datetime 中导入 datetime，用来生成月份文件夹名称和日志时间。
 from datetime import datetime
 # 从 pathlib 中导入 Path，用来更方便地处理文件路径。
 from pathlib import Path
-# 从 tkinter 中导入文件选择窗口、消息框和主题控件。
-from tkinter import filedialog, messagebox, ttk
+# 从 tkinter 中导入文件选择窗口和消息框。
+from tkinter import filedialog, messagebox
 
 
 # 定义分类规则：字典的键是文件夹名称，值是允许放入该文件夹的扩展名集合。
@@ -526,22 +528,22 @@ def undo_moves(
 class OrganizerApp:
     """文件整理助手的图形界面。"""
 
-    # 设置窗口背景颜色。
-    BACKGROUND_COLOR = "#f5f7fb"
-    # 设置主要文字颜色。
-    TEXT_COLOR = "#1f2937"
-    # 设置次要文字颜色。
-    MUTED_COLOR = "#6b7280"
-    # 设置“开始整理”按钮的颜色。
-    ACCENT_COLOR = "#2563eb"
-    # 设置“开始整理”按钮被按下时的颜色。
-    ACCENT_ACTIVE_COLOR = "#1d4ed8"
-    # 设置次要按钮的按下背景颜色。
-    SECONDARY_ACTIVE_COLOR = "#eff6ff"
-    # 设置已配置状态的提示颜色。
-    SUCCESS_COLOR = "#15803d"
+    # 使用接近现代 AI 产品网页的浅灰蓝底色。
+    BACKGROUND_COLOR = "#F5F7FA"
+    SURFACE_COLOR = "#FFFFFF"
+    SOFT_SURFACE_COLOR = "#F1F5F9"
+    TEXT_COLOR = "#0F172A"
+    MUTED_COLOR = "#64748B"
+    ACCENT_COLOR = "#4F46E5"
+    ACCENT_HOVER_COLOR = "#6366F1"
+    ACCENT_ACTIVE_COLOR = "#4338CA"
+    LOG_BACKGROUND = "#111827"
+    LOG_TEXT_COLOR = "#E5E7EB"
+    LOG_MUTED_COLOR = "#94A3B8"
+    SUCCESS_COLOR = "#22C55E"
+    FONT_FAMILY = "Microsoft YaHei UI"
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: ctk.CTk) -> None:
         # 保存主窗口对象。
         self.root = root
         # 保存文件夹路径，输入框会实时显示它的内容。
@@ -554,6 +556,8 @@ class OrganizerApp:
         self.api_key = tk.StringVar()
         # 记录界面上次读取或保存后，.env 中是否已经有 Key。
         self.api_key_configured = False
+        # 保存 API Key 设置窗口，避免重复打开多个弹窗。
+        self.api_dialog: ctk.CTkToplevel | None = None
         # 创建一个线程安全队列，用来接收后台线程发来的日志。
         self.message_queue: queue.Queue = queue.Queue()
         # 记录当前是否正在整理或撤销，防止重复点击。
@@ -563,320 +567,340 @@ class OrganizerApp:
 
         # 设置窗口标题。
         self.root.title("文件整理助手")
-        # 设置窗口初始大小，为新增的下拉菜单和撤销按钮留出空间。
-        self.root.geometry("820x720")
-        # 设置窗口最小尺寸，避免控件被挤得过小。
-        self.root.minsize(680, 620)
+        # 使用更舒展的初始尺寸，让大量留白和深色日志区同时保持呼吸感。
+        self.root.geometry("980x800")
+        # 保证较窄窗口下仍能完整显示主操作与日志区。
+        self.root.minsize(760, 680)
         # 设置窗口背景颜色。
-        self.root.configure(bg=self.BACKGROUND_COLOR)
+        self.root.configure(fg_color=self.BACKGROUND_COLOR)
 
         # 创建并摆放界面上的所有控件。
         self._build_interface()
 
     def _build_interface(self) -> None:
-        """创建窗口中的所有控件。"""
+        """使用 customtkinter 创建极简浅色界面。"""
 
-        # 为下拉菜单单独设置字体，避免不同系统主题下文字过小。
-        ttk.Style(self.root).configure(
-            "Mode.TCombobox",
-            font=("Microsoft YaHei UI", 10),
+        # 主容器只负责留白和纵向节奏，不再使用任何可见外框。
+        main_frame = ctk.CTkFrame(
+            self.root,
+            fg_color="transparent",
+            corner_radius=0,
         )
+        main_frame.pack(fill="both", expand=True, padx=48, pady=34)
+        main_frame.grid_columnconfigure(0, weight=1)
+        # 只有日志区吸收多余高度，其他区域保持自然高度。
+        main_frame.grid_rowconfigure(6, weight=1)
 
-        # 创建主容器，四周留出空白，让界面看起来更整洁。
-        main_frame = tk.Frame(self.root, bg=self.BACKGROUND_COLOR, padx=28, pady=22)
-        # 让主容器填满窗口，并在窗口放大时自动伸缩。
-        main_frame.pack(fill="both", expand=True)
-        # 设置第一行（标题）按内容高度显示。
-        main_frame.rowconfigure(0, weight=0)
-        # 设置第二行（说明文字）按内容高度显示。
-        main_frame.rowconfigure(1, weight=0)
-        # 设置第三行（路径选择）按内容高度显示。
-        main_frame.rowconfigure(2, weight=0)
-        # 设置第四行（整理方式）按内容高度显示。
-        main_frame.rowconfigure(3, weight=0)
-        # 设置第五行（API Key 配置）按内容高度显示。
-        main_frame.rowconfigure(4, weight=0)
-        # 设置第六行（开始按钮）按内容高度显示。
-        main_frame.rowconfigure(5, weight=0)
-        # 设置第七行（日志标题）按内容高度显示。
-        main_frame.rowconfigure(6, weight=0)
-        # 设置第八行（日志框）占据剩余空间。
-        main_frame.rowconfigure(7, weight=1)
-        # 设置第九行（撤销按钮）按内容高度显示。
-        main_frame.rowconfigure(8, weight=0)
-        # 让内容能够随窗口宽度伸缩。
-        main_frame.columnconfigure(0, weight=1)
-
-        # 创建窗口标题。
-        title_label = tk.Label(
+        # 顶部品牌与说明使用单列排版，保留充足呼吸空间。
+        header_frame = ctk.CTkFrame(
             main_frame,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 28))
+
+        title_label = ctk.CTkLabel(
+            header_frame,
             text="文件整理助手",
-            font=("Microsoft YaHei UI", 20, "bold"),
-            bg=self.BACKGROUND_COLOR,
-            fg=self.TEXT_COLOR,
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=30,
+                weight="bold",
+            ),
+            text_color=self.TEXT_COLOR,
             anchor="w",
         )
-        # 把标题放在第一行。
-        title_label.grid(row=0, column=0, sticky="w")
+        title_label.pack(anchor="w")
 
-        # 创建一句简短说明，告诉用户这个程序能做什么。
-        subtitle_label = tk.Label(
+        subtitle_label = ctk.CTkLabel(
+            header_frame,
+            text="选择目录，剩下的交给秩序。",
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=13),
+            text_color=self.MUTED_COLOR,
+            anchor="w",
+        )
+        subtitle_label.pack(anchor="w", pady=(8, 0))
+
+        # 路径区标题使用轻盈的小号标签。
+        path_label = ctk.CTkLabel(
             main_frame,
-            text="选择文件夹，按类型或修改月份自动归类；整理后可一键撤销。",
-            font=("Microsoft YaHei UI", 10),
-            bg=self.BACKGROUND_COLOR,
-            fg=self.MUTED_COLOR,
+            text="工作目录",
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=12,
+                weight="bold",
+            ),
+            text_color=self.TEXT_COLOR,
             anchor="w",
         )
-        # 把说明文字放在第二行，并在下方留出间距。
-        subtitle_label.grid(row=1, column=0, sticky="w", pady=(4, 20))
+        path_label.grid(row=1, column=0, sticky="w", pady=(0, 10))
 
-        # 创建路径选择区域。
-        path_frame = tk.Frame(main_frame, bg=self.BACKGROUND_COLOR)
-        # 让路径区域横向铺满。
-        path_frame.grid(row=2, column=0, sticky="ew")
-        # 让中间的输入框能够自动伸缩。
-        path_frame.columnconfigure(1, weight=1)
-
-        # 创建“文件夹路径”标签。
-        path_label = tk.Label(
-            path_frame,
-            text="文件夹路径",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            bg=self.BACKGROUND_COLOR,
-            fg=self.TEXT_COLOR,
+        # 大圆角白色输入框模拟网页搜索框，前后不添加边框线。
+        path_frame = ctk.CTkFrame(
+            main_frame,
+            fg_color="transparent",
+            corner_radius=0,
         )
-        # 把标签放在路径区域最左边。
-        path_label.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        path_frame.grid(row=2, column=0, sticky="ew")
+        path_frame.grid_columnconfigure(0, weight=1)
 
-        # 创建路径输入框，用户也可以手动输入路径。
-        self.path_entry = ttk.Entry(
+        self.path_entry = ctk.CTkEntry(
             path_frame,
             textvariable=self.folder_path,
-            font=("Microsoft YaHei UI", 11),
+            placeholder_text="选择或粘贴要整理的文件夹路径",
+            height=54,
+            corner_radius=16,
+            border_width=0,
+            fg_color=self.SURFACE_COLOR,
+            text_color=self.TEXT_COLOR,
+            placeholder_text_color="#94A3B8",
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=13),
         )
-        # 让输入框占据路径区域的中间位置。
-        self.path_entry.grid(row=0, column=1, sticky="ew", ipady=5)
+        self.path_entry.grid(row=0, column=0, sticky="ew")
 
-        # 创建“浏览”按钮，点击后打开系统文件夹选择窗口。
-        self.browse_button = ttk.Button(
+        # 浏览按钮保持白色次级按钮样式，悬浮时只改变柔和底色。
+        self.browse_button = ctk.CTkButton(
             path_frame,
-            text="浏览…",
+            text="浏览",
             command=self._choose_folder,
+            width=104,
+            height=54,
+            corner_radius=16,
+            border_width=0,
+            fg_color=self.SURFACE_COLOR,
+            hover_color="#E9EEF8",
+            text_color=self.TEXT_COLOR,
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=13,
+                weight="bold",
+            ),
+            cursor="hand2",
         )
-        # 把“浏览”按钮放在输入框右侧。
-        self.browse_button.grid(row=0, column=2, padx=(10, 0), ipady=3)
+        self.browse_button.grid(row=0, column=1, padx=(12, 0))
 
-        # 创建整理方式区域。
-        mode_frame = tk.Frame(main_frame, bg=self.BACKGROUND_COLOR)
-        # 让整理方式区域横向铺满，并在上方留出间距。
-        mode_frame.grid(row=3, column=0, sticky="ew", pady=(14, 0))
-        # 让右侧 AI 复选框能够占据剩余宽度。
-        mode_frame.columnconfigure(2, weight=1)
-
-        # 创建“整理方式”标签。
-        mode_label = tk.Label(
-            mode_frame,
-            text="整理方式",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            bg=self.BACKGROUND_COLOR,
-            fg=self.TEXT_COLOR,
+        # 将整理模式和 AI 开关放入一张无边框白色圆角卡片。
+        mode_frame = ctk.CTkFrame(
+            main_frame,
+            fg_color=self.SURFACE_COLOR,
+            corner_radius=20,
+            border_width=0,
         )
-        # 把标签放在整理方式区域最左边。
-        mode_label.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        mode_frame.grid(row=3, column=0, sticky="ew", pady=(20, 0))
+        mode_frame.grid_columnconfigure(0, weight=1)
+        mode_frame.grid_columnconfigure(1, weight=1)
 
-        # 创建下拉菜单，让用户选择按类型或按修改时间整理。
-        self.mode_combo = ttk.Combobox(
+        mode_label = ctk.CTkLabel(
             mode_frame,
-            textvariable=self.selected_mode,
-            values=[label for label, _ in MODE_OPTIONS],
-            state="readonly",
-            width=20,
-            style="Mode.TCombobox",
-        )
-        # 把下拉菜单放在标签右侧。
-        self.mode_combo.grid(row=0, column=1, sticky="w", ipady=3)
-
-        # 创建 AI 智能重命名复选框，并将它与整理方式放在同一行。
-        # BooleanVar 会把勾选状态转换成 True/False，点击整理时固定本次取值。
-        self.ai_checkbox = tk.Checkbutton(
-            mode_frame,
-            text="是否使用 AI 智能重命名文档 (极慢)",
-            variable=self.use_ai,
-            font=("Microsoft YaHei UI", 10),
-            bg=self.BACKGROUND_COLOR,
-            fg=self.TEXT_COLOR,
-            activebackground=self.BACKGROUND_COLOR,
-            activeforeground=self.TEXT_COLOR,
-            selectcolor="#ffffff",
+            text="整理偏好",
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=12,
+                weight="bold",
+            ),
+            text_color=self.TEXT_COLOR,
             anchor="w",
         )
-        # 把复选框放在下拉菜单右侧，并留出一点间距。
-        self.ai_checkbox.grid(
+        mode_label.grid(
             row=0,
-            column=2,
+            column=0,
             sticky="w",
-            padx=(18, 0),
+            padx=(24, 0),
+            pady=(20, 14),
         )
 
-        # 创建一条提示，说明按修改时间整理会生成什么样的文件夹。
-        mode_hint = tk.Label(
+        # 分段按钮比传统下拉框更接近现代 AI 产品中的轻量选项切换。
+        self.mode_combo = ctk.CTkSegmentedButton(
             mode_frame,
-            text="按修改时间会创建如 2026-10 的月份文件夹",
-            font=("Microsoft YaHei UI", 9),
-            bg=self.BACKGROUND_COLOR,
-            fg=self.MUTED_COLOR,
+            values=[label for label, _ in MODE_OPTIONS],
+            variable=self.selected_mode,
+            height=40,
+            corner_radius=12,
+            border_width=0,
+            fg_color=self.SOFT_SURFACE_COLOR,
+            selected_color="#E0E7FF",
+            selected_hover_color="#DBEAFE",
+            unselected_color=self.SOFT_SURFACE_COLOR,
+            unselected_hover_color="#E2E8F0",
+            text_color=self.TEXT_COLOR,
+            text_color_disabled="#94A3B8",
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
+        )
+        self.mode_combo.grid(
+            row=1,
+            column=0,
+            sticky="w",
+            padx=(24, 12),
+            pady=(0, 20),
+        )
+
+        # AI 开关放在同一张卡片右侧，减少主界面的视觉层级。
+        self.ai_checkbox = ctk.CTkSwitch(
+            mode_frame,
+            text="AI 智能重命名",
+            variable=self.use_ai,
+            onvalue=True,
+            offvalue=False,
+            width=0,
+            fg_color="#CBD5E1",
+            progress_color=self.ACCENT_COLOR,
+            button_color="#FFFFFF",
+            button_hover_color="#EEF2FF",
+            text_color=self.TEXT_COLOR,
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=12,
+                weight="bold",
+            ),
+            cursor="hand2",
+        )
+        self.ai_checkbox.grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=(12, 24),
+            pady=(20, 14),
+        )
+
+        mode_hint = ctk.CTkLabel(
+            mode_frame,
+            text="仅处理 .txt / .md · 调用 DeepSeek",
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=11),
+            text_color=self.MUTED_COLOR,
             anchor="e",
         )
-        # 第二行提示可以避免长复选框文字导致窗口横向溢出。
         mode_hint.grid(
             row=1,
             column=1,
-            columnspan=2,
             sticky="e",
-            pady=(6, 0),
+            padx=(12, 24),
+            pady=(0, 20),
         )
 
-        # 创建 API Key 配置区域，让用户不需要手动编辑 .env。
-        api_frame = tk.Frame(main_frame, bg=self.BACKGROUND_COLOR)
-        # 让 Key 输入框占据剩余宽度。
-        api_frame.columnconfigure(1, weight=1)
-        # 在整理方式下方留出间距。
-        api_frame.grid(row=4, column=0, sticky="ew", pady=(14, 0))
-
-        # 创建 Key 输入框前的说明标签。
-        api_label = tk.Label(
-            api_frame,
-            text="API Key",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            bg=self.BACKGROUND_COLOR,
-            fg=self.TEXT_COLOR,
-        )
-        api_label.grid(row=0, column=0, sticky="w", padx=(0, 12))
-
-        # 输入框始终隐藏真实字符，避免 Key 在界面中明文显示。
-        self.api_key_entry = ttk.Entry(
-            api_frame,
-            textvariable=self.api_key,
-            show="*",
-            font=("Microsoft YaHei UI", 11),
-        )
-        self.api_key_entry.grid(row=0, column=1, sticky="ew", ipady=5)
-
-        # 保存按钮只负责写入当前目录的 .env，不发起网络请求。
-        self.save_api_key_button = ttk.Button(
-            api_frame,
-            text="保存 Key",
-            command=self._save_api_key,
-        )
-        self.save_api_key_button.grid(row=0, column=2, padx=(10, 0), ipady=3)
-
-        # 状态提示紧邻输入框，让用户确认启动时是否读取到 Key。
-        self.api_key_status_label = tk.Label(
-            api_frame,
-            text="",
-            font=("Microsoft YaHei UI", 9),
-            bg=self.BACKGROUND_COLOR,
-            fg=self.MUTED_COLOR,
-            anchor="w",
-        )
-        self.api_key_status_label.grid(
-            row=0,
-            column=3,
-            sticky="w",
-            padx=(12, 0),
-        )
-
-        # 已配置时聚焦输入框会自动选中掩码，直接输入即可覆盖。
-        self.api_key_entry.bind("<FocusIn>", self._prepare_api_key_edit)
-        self._refresh_api_key_status()
-
-        # 创建“开始整理”按钮。
-        self.start_button = tk.Button(
+        # 主操作按钮使用清晰的单一靛蓝 CTA，并在悬浮时提亮。
+        self.start_button = ctk.CTkButton(
             main_frame,
             text="开始整理",
             command=self._start_organizing,
-            font=("Microsoft YaHei UI", 14, "bold"),
-            bg=self.ACCENT_COLOR,
-            fg="white",
-            activebackground=self.ACCENT_ACTIVE_COLOR,
-            activeforeground="white",
-            disabledforeground="#dbeafe",
-            relief="flat",
-            bd=0,
+            height=56,
+            corner_radius=16,
+            border_width=0,
+            fg_color=self.ACCENT_COLOR,
+            hover_color=self.ACCENT_HOVER_COLOR,
+            text_color="#FFFFFF",
+            text_color_disabled="#C7D2FE",
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=15,
+                weight="bold",
+            ),
             cursor="hand2",
-            pady=12,
         )
-        # 让按钮横向铺满，并在上下留出间距。
-        self.start_button.grid(row=5, column=0, sticky="ew", pady=(18, 20))
+        self.start_button.grid(
+            row=4,
+            column=0,
+            sticky="ew",
+            pady=(22, 24),
+        )
 
-        # 创建“整理日志”标题。
-        log_title = tk.Label(
+        # 日志标题和绿色状态灯放在同一行，形成明确的信息层级。
+        log_header = ctk.CTkFrame(
             main_frame,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        log_header.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        log_header.grid_columnconfigure(0, weight=1)
+
+        log_title = ctk.CTkLabel(
+            log_header,
             text="整理日志",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            bg=self.BACKGROUND_COLOR,
-            fg=self.TEXT_COLOR,
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=12,
+                weight="bold",
+            ),
+            text_color=self.TEXT_COLOR,
             anchor="w",
         )
-        # 把日志标题放在日志框上方。
-        log_title.grid(row=6, column=0, sticky="w", pady=(0, 8))
+        log_title.grid(row=0, column=0, sticky="w")
 
-        # 创建日志区域的外框。
-        log_frame = tk.Frame(main_frame, bg="#d1d5db", padx=1, pady=1)
-        # 让日志区域占据剩余的垂直空间。
-        log_frame.grid(row=7, column=0, sticky="nsew")
-        # 让文本框能够自动伸缩。
-        log_frame.rowconfigure(0, weight=1)
-        log_frame.columnconfigure(0, weight=1)
+        self.status_label = ctk.CTkLabel(
+            log_header,
+            text="●  就绪",
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=11,
+                weight="bold",
+            ),
+            text_color=self.SUCCESS_COLOR,
+            anchor="e",
+        )
+        self.status_label.grid(row=0, column=1, sticky="e")
 
-        # 创建显示整理过程的文本框。
-        self.log_text = tk.Text(
-            log_frame,
+        # 深色终端风格日志区让浅色主界面拥有清晰的视觉锚点。
+        self.log_text = ctk.CTkTextbox(
+            main_frame,
             wrap="word",
-            font=("Microsoft YaHei UI", 10),
-            bg="#ffffff",
-            fg=self.TEXT_COLOR,
-            relief="flat",
-            bd=0,
-            padx=12,
-            pady=10,
+            corner_radius=18,
+            border_width=0,
+            border_spacing=18,
+            fg_color=self.LOG_BACKGROUND,
+            text_color=self.LOG_TEXT_COLOR,
+            scrollbar_button_color="#334155",
+            scrollbar_button_hover_color="#475569",
+            font=ctk.CTkFont(family="Cascadia Mono", size=12),
+            activate_scrollbars=True,
             state="disabled",
         )
-        # 把日志文本框放在外框内。
-        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.log_text.grid(row=6, column=0, sticky="nsew")
 
-        # 创建日志滚动条，方便查看较长的记录。
-        scrollbar = ttk.Scrollbar(
-            log_frame,
-            orient="vertical",
-            command=self.log_text.yview,
-        )
-        # 把滚动条放在文本框右侧。
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        # 让文本框的滚动操作同步到滚动条。
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-
-        # 创建“撤销上一步”按钮，放在界面最下方。
-        self.undo_button = tk.Button(
+        # 底部只保留两个低存在感操作，把 API Key 配置彻底收进弹窗。
+        footer_frame = ctk.CTkFrame(
             main_frame,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        footer_frame.grid(row=7, column=0, sticky="ew", pady=(16, 0))
+        footer_frame.grid_columnconfigure(0, weight=1)
+
+        self.settings_button = ctk.CTkButton(
+            footer_frame,
+            text="⚙  设置 API Key",
+            command=self._open_api_key_dialog,
+            width=132,
+            height=32,
+            corner_radius=10,
+            border_width=0,
+            fg_color="transparent",
+            hover_color="#E9EEF8",
+            text_color=self.MUTED_COLOR,
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=11),
+            cursor="hand2",
+        )
+        self.settings_button.grid(row=0, column=0, sticky="w")
+
+        self.undo_button = ctk.CTkButton(
+            footer_frame,
             text="撤销上一步",
             command=self._start_undo,
-            font=("Microsoft YaHei UI", 11, "bold"),
-            bg="#ffffff",
-            fg=self.ACCENT_COLOR,
-            activebackground=self.SECONDARY_ACTIVE_COLOR,
-            activeforeground=self.ACCENT_ACTIVE_COLOR,
-            disabledforeground="#9ca3af",
-            relief="solid",
-            bd=1,
-            highlightthickness=0,
-            cursor="hand2",
-            pady=8,
+            width=142,
+            height=40,
+            corner_radius=12,
+            border_width=0,
+            fg_color="transparent",
+            hover_color="#E9EEF8",
+            text_color="#475569",
+            text_color_disabled="#94A3B8",
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=12,
+                weight="bold",
+            ),
+            cursor="arrow",
             state="disabled",
         )
-        # 让撤销按钮横向铺满，并与日志区域拉开一点距离。
-        self.undo_button.grid(row=8, column=0, sticky="ew", pady=(14, 0))
+        self.undo_button.grid(row=0, column=1, sticky="e")
 
         # 在程序启动时显示欢迎提示。
         self._append_log("请选择文件夹和整理方式，然后点击“开始整理”。")
@@ -888,25 +912,192 @@ class OrganizerApp:
         self.path_entry.bind("<Return>", lambda event: self._start_organizing())
         # 初始化时没有撤销记录，让撤销按钮保持禁用样式。
         self._update_undo_button()
+        # 初始化 Key 配置状态；真实 Key 不会进入主界面。
+        self._refresh_api_key_status()
 
     def _refresh_api_key_status(self) -> None:
-        """根据当前 .env 更新 Key 输入框和状态提示。"""
+        """根据当前 .env 更新设置弹窗中的 Key 状态。"""
 
         self.api_key_configured = env_has_api_key()
         if self.api_key_configured:
             # 只显示固定长度的掩码，不把真实 Key 放进 Tk 变量。
             self.api_key.set(API_KEY_MASK)
+        elif self.api_key.get() == API_KEY_MASK:
+            self.api_key.set("")
+
+        # 主界面保持纯净，状态提示只在 Key 设置弹窗打开时显示。
+        if (
+            self.api_dialog is not None
+            and self.api_dialog.winfo_exists()
+            and hasattr(self, "api_key_status_label")
+        ):
             self.api_key_status_label.configure(
-                text="API Key 已配置",
-                fg=self.SUCCESS_COLOR,
+                text=(
+                    "●  API Key 已配置"
+                    if self.api_key_configured
+                    else "○  API Key 未配置"
+                ),
+                text_color=(
+                    self.SUCCESS_COLOR
+                    if self.api_key_configured
+                    else self.MUTED_COLOR
+                ),
             )
-        else:
-            if self.api_key.get() == API_KEY_MASK:
-                self.api_key.set("")
-            self.api_key_status_label.configure(
-                text="API Key 未配置",
-                fg=self.MUTED_COLOR,
-            )
+
+    def _open_api_key_dialog(self) -> None:
+        """打开隐藏的 API Key 设置窗口。"""
+
+        if self.is_running:
+            return
+
+        if self.api_dialog is not None and self.api_dialog.winfo_exists():
+            self._refresh_api_key_status()
+            self.api_dialog.deiconify()
+            self.api_dialog.lift()
+            self.api_dialog.focus_force()
+            return
+
+        dialog = ctk.CTkToplevel(self.root)
+        self.api_dialog = dialog
+        dialog.title("API Key 设置")
+        dialog.geometry("520x370")
+        dialog.resizable(False, False)
+        dialog.configure(fg_color=self.BACKGROUND_COLOR)
+        dialog.transient(self.root)
+        dialog.protocol("WM_DELETE_WINDOW", self._close_api_key_dialog)
+
+        content = ctk.CTkFrame(
+            dialog,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        content.pack(fill="both", expand=True, padx=34, pady=28)
+        content.grid_columnconfigure(0, weight=1)
+
+        title_label = ctk.CTkLabel(
+            content,
+            text="API Key 设置",
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=22,
+                weight="bold",
+            ),
+            text_color=self.TEXT_COLOR,
+            anchor="w",
+        )
+        title_label.grid(row=0, column=0, sticky="w")
+
+        description_label = ctk.CTkLabel(
+            content,
+            text="用于 DeepSeek 智能重命名，密钥只保存在本机 .env 文件中。",
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=11),
+            text_color=self.MUTED_COLOR,
+            anchor="w",
+            justify="left",
+        )
+        description_label.grid(row=1, column=0, sticky="w", pady=(8, 24))
+
+        self.api_key_entry = ctk.CTkEntry(
+            content,
+            textvariable=self.api_key,
+            show="*",
+            height=52,
+            corner_radius=15,
+            border_width=0,
+            fg_color=self.SURFACE_COLOR,
+            text_color=self.TEXT_COLOR,
+            placeholder_text="输入新的 API Key",
+            placeholder_text_color="#94A3B8",
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=13),
+        )
+        self.api_key_entry.grid(row=2, column=0, sticky="ew")
+
+        self.api_key_status_label = ctk.CTkLabel(
+            content,
+            text="",
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=11,
+                weight="bold",
+            ),
+            text_color=self.MUTED_COLOR,
+            anchor="w",
+        )
+        self.api_key_status_label.grid(
+            row=3,
+            column=0,
+            sticky="w",
+            pady=(10, 0),
+        )
+
+        button_frame = ctk.CTkFrame(
+            content,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        button_frame.grid(row=4, column=0, sticky="ew", pady=(24, 0))
+        button_frame.grid_columnconfigure(0, weight=1)
+
+        # 保存 Key 保持次级视觉，真正的主 CTA 仍然只有“开始整理”。
+        self.save_api_key_button = ctk.CTkButton(
+            button_frame,
+            text="保存 Key",
+            command=self._save_api_key,
+            width=116,
+            height=42,
+            corner_radius=12,
+            border_width=0,
+            fg_color=self.SURFACE_COLOR,
+            hover_color="#E9EEF8",
+            text_color=self.TEXT_COLOR,
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=12,
+                weight="bold",
+            ),
+            cursor="hand2",
+        )
+        self.save_api_key_button.grid(row=0, column=1, padx=(10, 0))
+
+        close_button = ctk.CTkButton(
+            button_frame,
+            text="取消",
+            command=self._close_api_key_dialog,
+            width=82,
+            height=42,
+            corner_radius=12,
+            border_width=0,
+            fg_color="transparent",
+            hover_color="#E9EEF8",
+            text_color=self.MUTED_COLOR,
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=12),
+            cursor="hand2",
+        )
+        close_button.grid(row=0, column=2, padx=(8, 0))
+
+        # 已配置时聚焦输入框会自动选中掩码，直接输入即可覆盖。
+        self.api_key_entry.bind("<FocusIn>", self._prepare_api_key_edit)
+        self.api_key_entry.bind(
+            "<Return>",
+            lambda _event: self._save_api_key(),
+        )
+        self._refresh_api_key_status()
+        dialog.after(20, dialog.grab_set)
+        dialog.after(40, self.api_key_entry.focus_set)
+
+    def _close_api_key_dialog(self) -> None:
+        """关闭 API Key 设置弹窗并清理输入内容。"""
+
+        dialog = self.api_dialog
+        self.api_dialog = None
+        self.api_key.set("")
+        if dialog is None or not dialog.winfo_exists():
+            return
+        try:
+            dialog.grab_release()
+        except tk.TclError:
+            pass
+        dialog.destroy()
 
     def _prepare_api_key_edit(self, _event: tk.Event) -> None:
         """双击或聚焦已配置的掩码时，自动全选以便直接输入新 Key。"""
@@ -919,8 +1110,10 @@ class OrganizerApp:
         """选中 Key 掩码，用户键入的第一个字符会直接替换它。"""
 
         if self.api_key.get() == API_KEY_MASK:
-            self.api_key_entry.selection_range(0, "end")
-            self.api_key_entry.icursor("end")
+            entry_widget = getattr(self.api_key_entry, "_entry", None)
+            if entry_widget is not None:
+                entry_widget.selection_range(0, "end")
+                entry_widget.icursor("end")
 
     def _save_api_key(self) -> None:
         """把输入框中的新 Key 保存到 .env。"""
@@ -928,6 +1121,7 @@ class OrganizerApp:
         if self.is_running:
             return
 
+        dialog_parent = self.api_dialog or self.root
         api_key = self.api_key.get().strip()
         if api_key == API_KEY_MASK:
             self._refresh_api_key_status()
@@ -935,14 +1129,15 @@ class OrganizerApp:
                 messagebox.showinfo(
                     "保存成功",
                     "API Key 已配置，无需重复保存。",
-                    parent=self.root,
+                    parent=dialog_parent,
                 )
+                self._close_api_key_dialog()
             else:
                 self.api_key.set("")
                 messagebox.showwarning(
                     "API Key 为空",
                     "请先填写 API Key。",
-                    parent=self.root,
+                    parent=dialog_parent,
                 )
                 self.api_key_entry.focus_set()
             return
@@ -951,7 +1146,7 @@ class OrganizerApp:
             messagebox.showwarning(
                 "API Key 为空",
                 "请先填写 API Key。",
-                parent=self.root,
+                parent=dialog_parent,
             )
             self.api_key_entry.focus_set()
             return
@@ -962,7 +1157,7 @@ class OrganizerApp:
             messagebox.showerror(
                 "保存失败",
                 f"无法保存 API Key：\n{error}",
-                parent=self.root,
+                parent=dialog_parent,
             )
             return
 
@@ -972,8 +1167,9 @@ class OrganizerApp:
         messagebox.showinfo(
             "保存成功",
             "API Key 已保存。",
-            parent=self.root,
+            parent=dialog_parent,
         )
+        self._close_api_key_dialog()
 
     def _choose_folder(self) -> None:
         """打开系统文件夹选择窗口。"""
@@ -1031,10 +1227,10 @@ class OrganizerApp:
             self.path_entry.configure(state="disabled")
             self.browse_button.configure(state="disabled")
             self.mode_combo.configure(state="disabled")
-            self.api_key_entry.configure(state="disabled")
-            self.save_api_key_button.configure(state="disabled")
+            self.settings_button.configure(state="disabled")
             # 任务开始后不再允许改变 AI 开关，保证整个批次行为一致。
             self.ai_checkbox.configure(state="disabled")
+            self.status_label.configure(text="●  正在处理")
             return
 
         # 后台任务结束后，恢复所有输入控件的可用状态。
@@ -1046,11 +1242,11 @@ class OrganizerApp:
         )
         self.path_entry.configure(state="normal")
         self.browse_button.configure(state="normal")
-        self.mode_combo.configure(state="readonly")
-        self.api_key_entry.configure(state="normal")
-        self.save_api_key_button.configure(state="normal")
+        self.mode_combo.configure(state="normal")
+        self.settings_button.configure(state="normal")
         # 任务结束后重新允许用户选择是否使用 AI。
         self.ai_checkbox.configure(state="normal")
+        self.status_label.configure(text="●  就绪")
         # 根据是否还有撤销记录决定撤销按钮是否可用。
         self._update_undo_button()
 
@@ -1377,20 +1573,20 @@ class OrganizerApp:
 
 # 定义启动图形界面的函数。
 def main() -> None:
-    """创建主窗口并进入 tkinter 事件循环。"""
+    """创建 customtkinter 主窗口并进入事件循环。"""
 
-    # 创建 tkinter 主窗口。
-    root = tk.Tk()
+    # 强制使用极简浅色模式，避免系统深色偏好改变最终视觉效果。
+    ctk.set_appearance_mode("light")
+    ctk.set_default_color_theme("blue")
+    # 使用固定像素布局，保证 125% / 150% 系统缩放下也不裁切右侧控件。
+    ctk.deactivate_automatic_dpi_awareness()
+
+    # 创建 customtkinter 主窗口。
+    root = ctk.CTk(fg_color=OrganizerApp.BACKGROUND_COLOR)
     # 设置窗口左上角图标；找不到图标时继续正常启动程序。
     try:
         root.iconbitmap("app_icon.ico")
     except (tk.TclError, OSError):
-        pass
-    # 使用较新的系统主题，让按钮和滚动条更接近系统样式。
-    try:
-        ttk.Style().theme_use("vista")
-    except tk.TclError:
-        # 如果当前系统没有 vista 主题，就继续使用默认主题。
         pass
     # 创建程序界面。
     OrganizerApp(root)
