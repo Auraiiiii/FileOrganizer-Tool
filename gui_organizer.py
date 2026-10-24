@@ -12,16 +12,24 @@
 # 延迟解析类型注解，让较旧版本的 Python 也能正常读取这个文件。
 from __future__ import annotations
 
+# 导入 json 模块，把界面偏好保存为可读的本地配置文件。
+import json
+# 导入 os 模块，用原子替换避免程序中断时留下半个 config.json。
+import os
 # 导入队列模块，用于让后台整理线程把日志安全地传给界面线程。
 import queue
 # 导入 shutil 模块，用来移动文件。
 import shutil
+# 导入 sys，用于区分源码运行和 PyInstaller 单文件运行。
+import sys
 # 导入 threading 模块，让文件整理和撤销都在后台运行，避免窗口卡住。
 import threading
 # 导入 tkinter，它是 Python 自带的图形界面库。
 import tkinter as tk
 # 导入 customtkinter，用圆角卡片和现代控件替换传统原生外观。
 import customtkinter as ctk
+# 导入 tkinterdnd2，用系统原生拖拽能力接收资源管理器中的文件夹。
+from tkinterdnd2 import COPY, DND_FILES, TkinterDnD
 # 从 dataclasses 中导入 dataclass，用来保存每一次文件移动记录。
 from dataclasses import dataclass
 # 从 datetime 中导入 datetime，用来生成月份文件夹名称和日志时间。
@@ -42,6 +50,20 @@ CATEGORY_RULES = {
     "Videos": {".mp4"},
     # 压缩包统一移动到 Archives 文件夹。
     "Archives": {".zip", ".rar"},
+}
+
+# 自定义分流沿用了默认分类的扩展名规则，避免两种入口产生不同判断。
+# 每项由界面显示文字和 CATEGORY_RULES 中的内部分类名称组成。
+DIVERSION_OPTIONS = (
+    ("图片", "Images"),
+    ("文档", "Documents"),
+    ("视频", "Videos"),
+    ("压缩包", "Archives"),
+)
+
+# 反向映射便于根据下拉菜单当前文字查找内部分类名称。
+DIVERSION_CATEGORY_LABELS = {
+    category: label for label, category in DIVERSION_OPTIONS
 }
 
 
@@ -69,6 +91,16 @@ ENV_FILE = Path(__file__).resolve().with_name(".env")
 API_KEY_ENV_NAME = "DEEPSEEK_API_KEY"
 # 界面中用于隐藏已保存 Key 的占位文字。
 API_KEY_MASK = "********"
+# 单文件打包后程序目录是 exe 所在位置，而不是会被清理的 PyInstaller 临时目录。
+APPLICATION_DIRECTORY = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+# 配置与程序放在同一目录，便于绿色版和源码版使用相同的恢复行为。
+CONFIG_FILE = APPLICATION_DIRECTORY / "config.json"
+# 配置格式版本便于以后升级字段时做兼容迁移。
+CONFIG_VERSION = 1
 
 
 def env_has_api_key(env_file: Path = ENV_FILE) -> bool:
@@ -153,6 +185,99 @@ class MoveRecord:
     original_path: Path
     # 保存文件整理后的目标路径。
     destination_path: Path
+
+
+@dataclass(frozen=True)
+class DiversionRule:
+    """一条“文件类型 -> 目标文件夹”的分流规则。"""
+
+    category: str
+    target_directory: Path
+
+
+def normalize_diversion_rules(raw_rules: object) -> list[DiversionRule]:
+    """从配置或界面数据中提取有效分流规则。
+
+    无效类型和空目标会被忽略；不要求目标此刻存在，这样网络盘暂时离线时，
+    规则仍能恢复到界面，并在真正整理时给出明确失败原因。
+    """
+
+    if not isinstance(raw_rules, list):
+        return []
+
+    valid_categories = {category for _, category in DIVERSION_OPTIONS}
+    category_by_label = {
+        label: category for label, category in DIVERSION_OPTIONS
+    }
+    normalized_rules: list[DiversionRule] = []
+    for item in raw_rules:
+        if not isinstance(item, dict):
+            continue
+
+        raw_category = item.get("category", item.get("type"))
+        if not isinstance(raw_category, str):
+            continue
+        category = category_by_label.get(raw_category, raw_category)
+        if category not in valid_categories:
+            continue
+
+        raw_target = item.get(
+            "target_directory",
+            item.get("target", item.get("path")),
+        )
+        if not isinstance(raw_target, str):
+            continue
+        target_text = raw_target.strip().strip('"')
+        if not target_text:
+            continue
+
+        normalized_rules.append(
+            DiversionRule(
+                category=category,
+                target_directory=Path(target_text).expanduser(),
+            )
+        )
+    return normalized_rules
+
+
+def read_app_config(
+    config_file: Path = CONFIG_FILE,
+) -> tuple[dict, str]:
+    """读取配置；缺失时返回空配置，损坏时返回可展示的警告。"""
+
+    try:
+        raw_config = json.loads(config_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, ""
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return {}, f"读取配置失败，已使用默认设置：{describe_exception(error)}"
+
+    if not isinstance(raw_config, dict):
+        return {}, "配置文件格式无效，已使用默认设置。"
+    return raw_config, ""
+
+
+def write_app_config(
+    config: dict,
+    config_file: Path = CONFIG_FILE,
+) -> None:
+    """以 UTF-8 JSON 原子写入配置，避免异常退出损坏原文件。"""
+
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary_file = config_file.with_name(f".{config_file.name}.tmp")
+    try:
+        with temporary_file.open("w", encoding="utf-8", newline="\n") as file:
+            json.dump(config, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_file, config_file)
+    except Exception:
+        try:
+            temporary_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # 定义函数，根据文件扩展名返回文件所属的分类名称。
@@ -254,6 +379,7 @@ def organize_directory(
     mode: str = MODE_BY_TYPE,
     move_records: list[MoveRecord] | None = None,
     use_ai: bool = False,
+    diversion_rules: list[DiversionRule] | None = None,
 ) -> tuple[int, int]:
     """整理指定文件夹，并返回（成功数量，失败数量）。
 
@@ -263,6 +389,7 @@ def organize_directory(
     mode：整理模式，MODE_BY_TYPE 表示按类型，MODE_BY_TIME 表示按修改月份。
     move_records：用于收集成功移动记录的列表，供“撤销上一步”使用。
     use_ai：为 True 时尝试为 .txt/.md 文件生成 AI 摘要并重命名。
+    diversion_rules：按顺序匹配的“文件类型 -> 目标文件夹”规则列表。
     """
 
     # 如果没有提供日志函数，就使用一个什么都不做的小函数。
@@ -276,6 +403,68 @@ def organize_directory(
     # 如果没有传入记录列表，就创建一个临时列表，保证函数仍然可以独立使用。
     if move_records is None:
         move_records = []
+
+    # 逐条校验规则；无效目标只影响对应类型，其他规则和默认整理仍可继续。
+    # 同类型规则按界面顺序取第一条，避免文件目标依赖偶然的字典顺序。
+    validated_rules: list[DiversionRule] = []
+    configured_categories: set[str] = set()
+    source_resolved = source_directory.resolve()
+    for rule in diversion_rules or []:
+        category_label = DIVERSION_CATEGORY_LABELS.get(
+            rule.category,
+            "未知类型",
+        )
+        if rule.category not in DIVERSION_CATEGORY_LABELS:
+            log_callback(
+                f"[分流] 忽略无效类型：{category_label}。"
+            )
+            continue
+        if rule.category in configured_categories:
+            log_callback(
+                f"[分流] {category_label}存在多条规则，"
+                "按列表顺序使用第一条。"
+            )
+            continue
+
+        target_directory = Path(rule.target_directory).expanduser()
+        if not target_directory.exists():
+            log_callback(
+                f"[分流] {category_label}的目标文件夹不存在："
+                f"{target_directory}，该类型将按默认方式整理。"
+            )
+            continue
+        if not target_directory.is_dir():
+            log_callback(
+                f"[分流] {category_label}的目标路径不是文件夹："
+                f"{target_directory}，该类型将按默认方式整理。"
+            )
+            continue
+
+        try:
+            target_directory = target_directory.resolve()
+        except OSError as error:
+            log_callback(
+                f"[分流] 无法解析{category_label}的目标文件夹："
+                f"{describe_exception(error)}，该类型将按默认方式整理。"
+            )
+            continue
+        if target_directory == source_resolved:
+            log_callback(
+                f"[分流] {category_label}的目标不能与工作目录相同，"
+                "该类型将按默认方式整理。"
+            )
+            continue
+
+        configured_categories.add(rule.category)
+        validated_rules.append(
+            DiversionRule(
+                category=rule.category,
+                target_directory=target_directory,
+            )
+        )
+        log_callback(
+            f"[分流] 已启用：{category_label} -> {target_directory}"
+        )
 
     # 保存需要跳过的文件路径，统一转换成绝对路径，方便比较。
     protected_paths = {path.resolve() for path in (skip_paths or set())}
@@ -397,16 +586,31 @@ def organize_directory(
                         )
                         current_path = file_path
 
-            # 根据用户选择的模式决定分类文件夹名称。
-            if mode == MODE_BY_TIME:
-                category = get_month_category(current_path)
+            # 按列表顺序查找首个同类型规则；未命中时继续原有分类方式。
+            current_category = get_category(current_path)
+            matched_rule = next(
+                (
+                    rule
+                    for rule in validated_rules
+                    if rule.category == current_category
+                ),
+                None,
+            )
+            if matched_rule is not None:
+                target_directory = matched_rule.target_directory
+                category = DIVERSION_CATEGORY_LABELS[matched_rule.category]
             else:
-                category = get_category(current_path)
+                # 根据用户选择的模式决定分类文件夹名称。
+                if mode == MODE_BY_TIME:
+                    category = get_month_category(current_path)
+                else:
+                    category = get_category(current_path)
 
-            # 拼接分类文件夹的完整路径。
-            target_directory = source_directory / category
-            # 创建分类文件夹；如果文件夹已经存在，不会报错。
-            target_directory.mkdir(parents=True, exist_ok=True)
+                # 拼接默认分类文件夹的完整路径。
+                target_directory = source_directory / category
+                # 创建分类文件夹；如果文件夹已经存在，不会报错。
+                target_directory.mkdir(parents=True, exist_ok=True)
+
             # 计算不会覆盖已有文件的目标路径。
             destination = build_destination(target_directory, current_path.name)
             # 把当前文件从原位置移动到分类文件夹中。
@@ -418,10 +622,22 @@ def organize_directory(
                     destination_path=destination.absolute(),
                 )
             )
-            # 把本次移动结果写入日志。
-            log_callback(f"已移动：{current_path.name} -> {category}/")
+            # 分流日志明确显示完整目标路径；普通分类保持原有简洁格式。
+            if matched_rule is not None:
+                log_callback(
+                    f"[分流] 已移动: {current_path.name} -> {destination}"
+                )
+            else:
+                log_callback(f"已移动：{current_path.name} -> {category}/")
             # 成功移动后，把成功数量加一。
             moved_count += 1
+        # 权限不足是跨盘和系统目录移动中最常见的问题，单独给出明确提示。
+        except PermissionError as error:
+            log_callback(
+                f"移动失败（权限不足）：{current_path.name}。"
+                f"请检查源文件和目标文件夹的写入权限（{error}）"
+            )
+            failed_count += 1
         # 捕获文件移动过程中可能出现的系统或权限错误。
         except OSError as error:
             # 输出失败原因，但不终止其他文件的整理。
@@ -525,6 +741,174 @@ def undo_moves(
     return restored_count, skipped_count, failed_count
 
 
+class DnDCTk(ctk.CTk, TkinterDnD.Tk):
+    """同时保留 CustomTkinter 渲染能力和 TkDND 拖拽能力的根窗口。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        # 先让 CTk 完成窗口、缩放和外观初始化。CTk 会直接初始化底层 Tk，
+        # 因此这里不能再次调用 TkinterDnD.Tk.__init__，否则会重复创建 Tcl
+        # 解释器并破坏界面。DnDWrapper 的全局控件接口已经由导入过程注册。
+        ctk.CTk.__init__(self, *args, **kwargs)
+        # 再向现有 Tcl 解释器加载 tkdnd，这是同时使用 CTk 与 TkinterDnD
+        # 时最稳定的方式；窗口仍由 CTk 完整管理，不需要替换控件体系。
+        self.TkdndVersion = TkinterDnD.require(self)
+
+
+class DiversionRuleRow:
+    """可添加、删除和单独选择目标目录的一条分流规则。"""
+
+    def __init__(
+        self,
+        app: OrganizerApp,
+        parent: ctk.CTkScrollableFrame,
+        category: str,
+        target_directory: str,
+    ) -> None:
+        self.app = app
+        self.type_var = tk.StringVar(
+            value=DIVERSION_CATEGORY_LABELS[category]
+        )
+        self.path_var = tk.StringVar(value=target_directory)
+
+        self.frame = ctk.CTkFrame(
+            parent,
+            fg_color=app.SOFT_SURFACE_COLOR,
+            corner_radius=12,
+            border_width=0,
+        )
+        self.frame.pack(fill="x", padx=4, pady=(0, 8))
+        self.frame.grid_columnconfigure(1, weight=1)
+
+        self.type_combo = ctk.CTkComboBox(
+            self.frame,
+            values=[label for label, _ in DIVERSION_OPTIONS],
+            variable=self.type_var,
+            state="readonly",
+            width=112,
+            height=38,
+            corner_radius=9,
+            border_width=0,
+            fg_color=app.SURFACE_COLOR,
+            button_color=app.SURFACE_COLOR,
+            button_hover_color="#E2E8F0",
+            dropdown_fg_color=app.SURFACE_COLOR,
+            dropdown_hover_color="#EEF2FF",
+            dropdown_text_color=app.TEXT_COLOR,
+            text_color=app.TEXT_COLOR,
+            text_color_disabled="#94A3B8",
+            font=ctk.CTkFont(family=app.FONT_FAMILY, size=12),
+            dropdown_font=ctk.CTkFont(family=app.FONT_FAMILY, size=12),
+        )
+        self.type_combo.grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(8, 0),
+            pady=8,
+        )
+
+        self.path_entry = ctk.CTkEntry(
+            self.frame,
+            textvariable=self.path_var,
+            placeholder_text="选择目标文件夹",
+            state="readonly",
+            height=38,
+            corner_radius=9,
+            border_width=0,
+            fg_color=app.SURFACE_COLOR,
+            text_color=app.TEXT_COLOR,
+            placeholder_text_color="#94A3B8",
+            font=ctk.CTkFont(family=app.FONT_FAMILY, size=11),
+        )
+        self.path_entry.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(8, 0),
+            pady=8,
+        )
+
+        self.browse_button = ctk.CTkButton(
+            self.frame,
+            text="浏览",
+            command=lambda: app._choose_diversion_folder(self),
+            width=66,
+            height=38,
+            corner_radius=9,
+            border_width=0,
+            fg_color=app.SURFACE_COLOR,
+            hover_color="#E9EEF8",
+            text_color=app.TEXT_COLOR,
+            font=ctk.CTkFont(
+                family=app.FONT_FAMILY,
+                size=11,
+                weight="bold",
+            ),
+            cursor="hand2",
+        )
+        self.browse_button.grid(
+            row=0,
+            column=2,
+            sticky="e",
+            padx=(8, 0),
+            pady=8,
+        )
+
+        self.delete_button = ctk.CTkButton(
+            self.frame,
+            text="×",
+            command=self.delete,
+            width=34,
+            height=38,
+            corner_radius=9,
+            border_width=0,
+            fg_color="transparent",
+            hover_color="#FEE2E2",
+            text_color="#DC2626",
+            font=ctk.CTkFont(
+                family=app.FONT_FAMILY,
+                size=20,
+                weight="bold",
+            ),
+            cursor="hand2",
+        )
+        self.delete_button.grid(
+            row=0,
+            column=3,
+            sticky="e",
+            padx=(4, 8),
+            pady=8,
+        )
+
+    def delete(self) -> None:
+        """从界面及规则集合中移除当前行。"""
+
+        if self.app.is_running:
+            return
+        if self in self.app.diversion_rows:
+            self.app.diversion_rows.remove(self)
+        self.frame.destroy()
+        self.app._refresh_diversion_empty_state()
+        self.app._append_log("已删除一条自定义分流规则。")
+
+    def selected_category(self) -> str | None:
+        """把当前显示的类型文字转换成内部分类名称。"""
+
+        selected_label = self.type_var.get()
+        for label, category in DIVERSION_OPTIONS:
+            if label == selected_label:
+                return category
+        return None
+
+    def set_busy(self, busy: bool) -> None:
+        """跟随整个任务切换当前行控件的可用状态。"""
+
+        self.type_combo.configure(state="disabled" if busy else "readonly")
+        self.path_entry.configure(state="disabled" if busy else "readonly")
+        self.browse_button.configure(state="disabled" if busy else "normal")
+        self.delete_button.configure(state="disabled" if busy else "normal")
+
+
 class OrganizerApp:
     """文件整理助手的图形界面。"""
 
@@ -543,15 +927,43 @@ class OrganizerApp:
     SUCCESS_COLOR = "#22C55E"
     FONT_FAMILY = "Microsoft YaHei UI"
 
-    def __init__(self, root: ctk.CTk) -> None:
+    def __init__(self, root: DnDCTk) -> None:
         # 保存主窗口对象。
         self.root = root
+        # 配置固定放在程序目录，避免依赖启动时的工作目录。
+        self.config_file = CONFIG_FILE
+        config, self._config_load_warning = read_app_config(self.config_file)
+
+        configured_work_directory = config.get("working_directory", "")
+        if not isinstance(configured_work_directory, str):
+            configured_work_directory = ""
         # 保存文件夹路径，输入框会实时显示它的内容。
-        self.folder_path = tk.StringVar()
+        self.folder_path = tk.StringVar(value=configured_work_directory)
+
+        configured_mode = config.get(
+            "organize_mode",
+            config.get("mode", MODE_BY_TYPE),
+        )
+        selected_mode_label = next(
+            (
+                label
+                for label, mode in MODE_OPTIONS
+                if mode == configured_mode
+            ),
+            MODE_OPTIONS[0][0],
+        )
         # 保存下拉菜单的当前选项。
-        self.selected_mode = tk.StringVar(value=MODE_OPTIONS[0][0])
+        self.selected_mode = tk.StringVar(value=selected_mode_label)
         # 保存 AI 复选框状态；默认关闭，避免普通整理也发起网络请求。
-        self.use_ai = tk.BooleanVar(value=False)
+        self.use_ai = tk.BooleanVar(value=config.get("use_ai") is True)
+        # 保存自定义分流的总开关；每条规则由动态行单独保存。
+        self.use_diversion = tk.BooleanVar(
+            value=config.get("diversion_enabled") is True
+        )
+        self.diversion_rows: list[DiversionRuleRow] = []
+        self._restored_diversion_rules = normalize_diversion_rules(
+            config.get("diversion_rules")
+        )
         # 保存 API Key 输入框内容；已配置时只显示掩码，不回填真实 Key。
         self.api_key = tk.StringVar()
         # 记录界面上次读取或保存后，.env 中是否已经有 Key。
@@ -568,14 +980,26 @@ class OrganizerApp:
         # 设置窗口标题。
         self.root.title("文件整理助手")
         # 使用更舒展的初始尺寸，让大量留白和深色日志区同时保持呼吸感。
-        self.root.geometry("980x800")
+        self.root.geometry("980x940")
         # 保证较窄窗口下仍能完整显示主操作与日志区。
-        self.root.minsize(760, 680)
+        self.root.minsize(780, 820)
         # 设置窗口背景颜色。
         self.root.configure(fg_color=self.BACKGROUND_COLOR)
 
         # 创建并摆放界面上的所有控件。
         self._build_interface()
+        # 控件创建后再恢复规则行，确保下拉菜单和日志区已经可用。
+        for rule in self._restored_diversion_rules:
+            self._add_diversion_rule(
+                rule.category,
+                str(rule.target_directory),
+                log=False,
+            )
+        self._refresh_diversion_empty_state()
+        if self._config_load_warning:
+            self._append_log(self._config_load_warning)
+        # 无论通过标题栏按钮还是系统关闭事件退出，都保存当前界面状态。
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_interface(self) -> None:
         """使用 customtkinter 创建极简浅色界面。"""
@@ -589,7 +1013,7 @@ class OrganizerApp:
         main_frame.pack(fill="both", expand=True, padx=48, pady=34)
         main_frame.grid_columnconfigure(0, weight=1)
         # 只有日志区吸收多余高度，其他区域保持自然高度。
-        main_frame.grid_rowconfigure(6, weight=1)
+        main_frame.grid_rowconfigure(7, weight=1)
 
         # 顶部品牌与说明使用单列排版，保留充足呼吸空间。
         header_frame = ctk.CTkFrame(
@@ -777,6 +1201,135 @@ class OrganizerApp:
             pady=(0, 20),
         )
 
+        # 自定义分流使用可滚动的规则列表；每行独立选择类型和目标目录。
+        diversion_frame = ctk.CTkFrame(
+            main_frame,
+            fg_color=self.SURFACE_COLOR,
+            corner_radius=18,
+            border_width=1,
+            border_color="#E2E8F0",
+        )
+        diversion_frame.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        diversion_frame.grid_columnconfigure(0, weight=1)
+
+        diversion_title = ctk.CTkLabel(
+            diversion_frame,
+            text="自定义分流",
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=12,
+                weight="bold",
+            ),
+            text_color=self.TEXT_COLOR,
+            anchor="w",
+        )
+        diversion_title.grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(20, 12),
+            pady=(14, 10),
+        )
+
+        self.diversion_checkbox = ctk.CTkCheckBox(
+            diversion_frame,
+            text="启用",
+            variable=self.use_diversion,
+            onvalue=True,
+            offvalue=False,
+            checkbox_width=20,
+            checkbox_height=20,
+            corner_radius=6,
+            border_width=2,
+            fg_color=self.ACCENT_COLOR,
+            hover_color=self.ACCENT_HOVER_COLOR,
+            border_color="#CBD5E1",
+            checkmark_color="#FFFFFF",
+            text_color=self.TEXT_COLOR,
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=11,
+                weight="bold",
+            ),
+            cursor="hand2",
+        )
+        self.diversion_checkbox.grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=(8, 12),
+            pady=(14, 10),
+        )
+
+        self.add_diversion_button = ctk.CTkButton(
+            diversion_frame,
+            text="+  添加分流规则",
+            command=self._add_diversion_rule,
+            width=132,
+            height=34,
+            corner_radius=9,
+            border_width=0,
+            fg_color="#EEF2FF",
+            hover_color="#E0E7FF",
+            text_color=self.ACCENT_COLOR,
+            font=ctk.CTkFont(
+                family=self.FONT_FAMILY,
+                size=11,
+                weight="bold",
+            ),
+            cursor="hand2",
+        )
+        self.add_diversion_button.grid(
+            row=0,
+            column=2,
+            sticky="e",
+            padx=(0, 20),
+            pady=(14, 10),
+        )
+
+        self.diversion_rules_frame = ctk.CTkScrollableFrame(
+            diversion_frame,
+            height=158,
+            corner_radius=12,
+            border_width=0,
+            fg_color="transparent",
+            scrollbar_button_color="#CBD5E1",
+            scrollbar_button_hover_color="#94A3B8",
+            orientation="vertical",
+        )
+        self.diversion_rules_frame.grid(
+            row=1,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            padx=16,
+            pady=0,
+        )
+
+        self.diversion_empty_label = ctk.CTkLabel(
+            self.diversion_rules_frame,
+            text="还没有分流规则。添加后，匹配的文件会移动到各自目标目录。",
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=11),
+            text_color=self.MUTED_COLOR,
+            anchor="center",
+        )
+
+        diversion_hint = ctk.CTkLabel(
+            diversion_frame,
+            text="按列表从上到下匹配；同一类型以第一条规则为准。",
+            font=ctk.CTkFont(family=self.FONT_FAMILY, size=10),
+            text_color=self.MUTED_COLOR,
+            anchor="w",
+        )
+        diversion_hint.grid(
+            row=2,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            padx=20,
+            pady=(8, 12),
+        )
+
         # 主操作按钮使用清晰的单一靛蓝 CTA，并在悬浮时提亮。
         self.start_button = ctk.CTkButton(
             main_frame,
@@ -797,10 +1350,10 @@ class OrganizerApp:
             cursor="hand2",
         )
         self.start_button.grid(
-            row=4,
+            row=5,
             column=0,
             sticky="ew",
-            pady=(22, 24),
+            pady=(16, 24),
         )
 
         # 日志标题和绿色状态灯放在同一行，形成明确的信息层级。
@@ -809,7 +1362,7 @@ class OrganizerApp:
             fg_color="transparent",
             corner_radius=0,
         )
-        log_header.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        log_header.grid(row=6, column=0, sticky="ew", pady=(0, 10))
         log_header.grid_columnconfigure(0, weight=1)
 
         log_title = ctk.CTkLabel(
@@ -853,7 +1406,7 @@ class OrganizerApp:
             activate_scrollbars=True,
             state="disabled",
         )
-        self.log_text.grid(row=6, column=0, sticky="nsew")
+        self.log_text.grid(row=7, column=0, sticky="nsew")
 
         # 底部只保留两个低存在感操作，把 API Key 配置彻底收进弹窗。
         footer_frame = ctk.CTkFrame(
@@ -861,7 +1414,7 @@ class OrganizerApp:
             fg_color="transparent",
             corner_radius=0,
         )
-        footer_frame.grid(row=7, column=0, sticky="ew", pady=(16, 0))
+        footer_frame.grid(row=8, column=0, sticky="ew", pady=(16, 0))
         footer_frame.grid_columnconfigure(0, weight=1)
 
         self.settings_button = ctk.CTkButton(
@@ -914,6 +1467,179 @@ class OrganizerApp:
         self._update_undo_button()
         # 初始化 Key 配置状态；真实 Key 不会进入主界面。
         self._refresh_api_key_status()
+        # 等全部控件创建完成后统一注册拖拽目标，确保窗口任意位置都能接收文件夹。
+        self._enable_folder_drop()
+
+    def _enable_folder_drop(self) -> None:
+        """把主窗口及全部子控件注册为文件夹放置目标。"""
+
+        self._register_folder_drop_tree(self.root)
+
+    def _register_folder_drop_tree(self, widget: tk.Misc) -> None:
+        """递归注册控件，并在之后新增规则行时复用。"""
+
+        # TkinterDnD 会为 BaseWidget 增加这些方法；逐个注册子控件可以
+        # 覆盖输入框、日志区和空白背景，行为等同于拖到整个窗口。
+        widget.drop_target_register(DND_FILES)
+        widget.dnd_bind("<<Drop>>", self._handle_drop)
+        for child in widget.winfo_children():
+            self._register_folder_drop_tree(child)
+
+    def _handle_drop(self, event: object) -> str:
+        """解析拖入路径：文件夹写入输入框，单个文件只显示提示。"""
+
+        # 后台任务进行中时保持当前路径不变，避免界面与正在执行的批次不一致。
+        if self.is_running:
+            return COPY
+
+        raw_data = getattr(event, "data", "")
+        try:
+            # event.data 是 Tcl 列表；splitlist 能正确处理带空格和花括号的路径。
+            dropped_items = self.root.tk.splitlist(raw_data)
+        except (tk.TclError, ValueError):
+            dropped_items = (raw_data,)
+
+        dropped_paths = [
+            Path(item).expanduser() for item in dropped_items if item
+        ]
+        folder = next(
+            (path for path in dropped_paths if path.is_dir()),
+            None,
+        )
+        if folder is None:
+            self._append_log("请拖入一个文件夹，而不是单个文件")
+            return COPY
+
+        # 使用绝对路径填入输入框，和“浏览”按钮选择的路径保持相同格式。
+        try:
+            folder = folder.resolve()
+        except OSError:
+            folder = folder.absolute()
+        self.folder_path.set(str(folder))
+        self._append_log(f"已识别拖入的文件夹: {folder}")
+        self.path_entry.focus_set()
+        # TkDND 的放置回调需要返回接受的拖拽动作。
+        return COPY
+
+    def _refresh_diversion_empty_state(self) -> None:
+        """根据规则数量和任务状态更新空列表提示与添加按钮。"""
+
+        if self.diversion_rows:
+            self.diversion_empty_label.pack_forget()
+        else:
+            self.diversion_empty_label.pack(
+                fill="x",
+                padx=18,
+                pady=48,
+            )
+
+        add_button_enabled = (
+            not self.is_running
+            and len(self.diversion_rows) < len(DIVERSION_OPTIONS)
+        )
+        self.add_diversion_button.configure(
+            state="normal" if add_button_enabled else "disabled",
+            cursor="hand2" if add_button_enabled else "arrow",
+        )
+
+    def _add_diversion_rule(
+        self,
+        category: str | None = None,
+        target_directory: str = "",
+        log: bool = True,
+    ) -> None:
+        """新增一条规则，默认优先选择尚未使用的文件类型。"""
+
+        if self.is_running:
+            return
+        if len(self.diversion_rows) >= len(DIVERSION_OPTIONS):
+            if log:
+                self._append_log("最多可添加四条分流规则，每种类型一条。")
+            return
+
+        valid_categories = {item for _, item in DIVERSION_OPTIONS}
+        if category not in valid_categories:
+            used_categories = {
+                row.selected_category() for row in self.diversion_rows
+            }
+            category = next(
+                (
+                    option_category
+                    for _, option_category in DIVERSION_OPTIONS
+                    if option_category not in used_categories
+                ),
+                DIVERSION_OPTIONS[0][1],
+            )
+
+        row = DiversionRuleRow(
+            self,
+            self.diversion_rules_frame,
+            category,
+            target_directory,
+        )
+        self.diversion_rows.append(row)
+        self._register_folder_drop_tree(row.frame)
+        self._refresh_diversion_empty_state()
+        if log:
+            label = DIVERSION_CATEGORY_LABELS[category]
+            self._append_log(f"已添加{label}分流规则，请选择目标文件夹。")
+
+    def _diversion_rules_from_ui(self) -> list[DiversionRule]:
+        """把当前规则行复制为后台线程可安全使用的不可变快照。"""
+
+        rules: list[DiversionRule] = []
+        for row in self.diversion_rows:
+            category = row.selected_category()
+            target_text = row.path_var.get().strip().strip('"')
+            if category is None or not target_text:
+                continue
+            rules.append(
+                DiversionRule(
+                    category=category,
+                    target_directory=Path(target_text).expanduser(),
+                )
+            )
+        return rules
+
+    def _current_config(self) -> dict:
+        """生成与界面一一对应的 JSON 可序列化配置。"""
+
+        diversion_rules = [
+            {
+                "category": rule.category,
+                "target_directory": str(rule.target_directory),
+            }
+            for rule in self._diversion_rules_from_ui()
+        ]
+        return {
+            "version": CONFIG_VERSION,
+            "working_directory": self.folder_path.get().strip(),
+            "use_ai": bool(self.use_ai.get()),
+            "organize_mode": self._selected_mode(),
+            "diversion_enabled": bool(self.use_diversion.get()),
+            "diversion_rules": diversion_rules,
+        }
+
+    def _save_config(self) -> str:
+        """保存当前配置并返回错误文本；成功时返回空字符串。"""
+
+        try:
+            write_app_config(self._current_config(), self.config_file)
+        except (OSError, TypeError, ValueError) as error:
+            return describe_exception(error)
+        return ""
+
+    def _on_close(self) -> None:
+        """在窗口关闭前同步保存配置，然后退出事件循环。"""
+
+        save_error = self._save_config()
+        if save_error:
+            messagebox.showwarning(
+                "配置未保存",
+                f"无法保存当前设置：\n{save_error}",
+                parent=self.root,
+            )
+        self.root.destroy()
 
     def _refresh_api_key_status(self) -> None:
         """根据当前 .env 更新设置弹窗中的 Key 状态。"""
@@ -1197,6 +1923,62 @@ class OrganizerApp:
             # 记录用户已经选择了文件夹。
             self._append_log(f"已选择文件夹：{selected_folder}")
 
+    def _choose_diversion_folder(self, row: DiversionRuleRow) -> None:
+        """为指定规则行选择自定义分流目标。"""
+
+        if self.is_running:
+            return
+
+        # 优先从已选分流目录开始浏览，其次定位到当前工作目录。
+        current_diversion = row.path_var.get().strip().strip('"')
+        current_source = self.folder_path.get().strip().strip('"')
+        if current_diversion and Path(current_diversion).expanduser().is_dir():
+            initial_directory = str(Path(current_diversion).expanduser())
+        elif current_source and Path(current_source).expanduser().is_dir():
+            initial_directory = str(Path(current_source).expanduser())
+        else:
+            initial_directory = str(Path.home())
+
+        selected_folder = filedialog.askdirectory(
+            parent=self.root,
+            title="选择自定义分流目标文件夹",
+            initialdir=initial_directory,
+            mustexist=True,
+        )
+        if not selected_folder:
+            return
+
+        selected_path = Path(selected_folder).expanduser()
+        try:
+            selected_path = selected_path.resolve()
+            source_resolved = (
+                Path(current_source).expanduser().resolve()
+                if current_source
+                else None
+            )
+        except (OSError, RuntimeError):
+            selected_path = selected_path.absolute()
+            source_resolved = (
+                Path(current_source).expanduser().absolute()
+                if current_source
+                else None
+            )
+
+        # 同目录无法形成分流；在选目录时直接阻止，比整理后再回退更清楚。
+        if source_resolved is not None and selected_path == source_resolved:
+            messagebox.showwarning(
+                "目标文件夹无效",
+                "分流目标不能与工作目录相同，请选择其他文件夹。",
+                parent=self.root,
+            )
+            return
+
+        row.path_var.set(str(selected_path))
+        category_label = row.type_var.get()
+        self._append_log(
+            f"已选择{category_label}分流目标：{selected_path}"
+        )
+
     def _selected_mode(self) -> str:
         """把下拉菜单显示的文字转换成内部整理模式。"""
 
@@ -1230,6 +2012,14 @@ class OrganizerApp:
             self.settings_button.configure(state="disabled")
             # 任务开始后不再允许改变 AI 开关，保证整个批次行为一致。
             self.ai_checkbox.configure(state="disabled")
+            # 分流开关和所有规则行同样固定，确保后台使用点击时的快照。
+            self.diversion_checkbox.configure(state="disabled")
+            self.add_diversion_button.configure(
+                state="disabled",
+                cursor="arrow",
+            )
+            for row in self.diversion_rows:
+                row.set_busy(True)
             self.status_label.configure(text="●  正在处理")
             return
 
@@ -1246,6 +2036,11 @@ class OrganizerApp:
         self.settings_button.configure(state="normal")
         # 任务结束后重新允许用户选择是否使用 AI。
         self.ai_checkbox.configure(state="normal")
+        # 目标路径始终恢复为只读，其他分流控件恢复可操作状态。
+        self.diversion_checkbox.configure(state="normal")
+        for row in self.diversion_rows:
+            row.set_busy(False)
+        self._refresh_diversion_empty_state()
         self.status_label.configure(text="●  就绪")
         # 根据是否还有撤销记录决定撤销按钮是否可用。
         self._update_undo_button()
@@ -1265,6 +2060,9 @@ class OrganizerApp:
         # 如果已经在整理或撤销，就忽略这次点击。
         if self.is_running:
             return
+
+        # 点击即保存，即使路径校验随后失败，也保留下一次启动所需的界面状态。
+        config_save_error = self._save_config()
 
         # 读取输入框中的路径，并去掉首尾空格和可能带上的双引号。
         raw_path = self.folder_path.get().strip().strip('"')
@@ -1296,11 +2094,18 @@ class OrganizerApp:
         mode = self._selected_mode()
         # 同样固定 AI 开关状态，避免后台线程读到随后变化的界面变量。
         use_ai = self.use_ai.get()
+        # 固定所有分流规则，整个批次只使用点击时的一组配置。
+        diversion_enabled = self.use_diversion.get()
+        diversion_rules = (
+            self._diversion_rules_from_ui() if diversion_enabled else []
+        )
         # 记录用户选择的模式名称，方便日志阅读。
         mode_label = self.selected_mode.get()
 
         # 清空上一次的日志，准备显示本次整理过程。
         self._clear_log()
+        if config_save_error:
+            self._append_log(f"配置保存失败：{config_save_error}")
         # 记录本次整理的文件夹和整理方式。
         self._append_log(f"开始整理：{source_directory}")
         self._append_log(f"整理方式：{mode_label}")
@@ -1309,13 +2114,27 @@ class OrganizerApp:
             if use_ai
             else "AI 智能重命名：未启用"
         )
+        if diversion_enabled:
+            if diversion_rules:
+                self._append_log(
+                    f"自定义分流：已启用，共 {len(diversion_rules)} 条规则"
+                )
+            else:
+                self._append_log("自定义分流：已启用，但没有完整规则")
+        else:
+            self._append_log("自定义分流：未启用")
         # 标记程序正在执行后台任务，并禁用相关控件。
         self._set_busy(True, "正在整理…")
 
         # 创建后台线程，把耗时的文件移动操作放到界面线程之外。
         worker = threading.Thread(
             target=self._organize_in_background,
-            args=(source_directory, mode, use_ai),
+            args=(
+                source_directory,
+                mode,
+                use_ai,
+                diversion_rules,
+            ),
             daemon=True,
         )
         # 启动后台线程。
@@ -1328,6 +2147,7 @@ class OrganizerApp:
         source_directory: Path,
         mode: str,
         use_ai: bool,
+        diversion_rules: list[DiversionRule],
     ) -> None:
         """在后台线程中执行整理，并通过队列把消息传回界面。"""
 
@@ -1350,11 +2170,14 @@ class OrganizerApp:
                     # AI 模块和密钥配置也是程序运行依赖，整理项目目录时不能移走。
                     Path(__file__).resolve().with_name("ai_renamer.py"),
                     Path(__file__).resolve().with_name(".env"),
+                    # 配置是程序下次启动依赖，整理源码目录时也必须保留原位。
+                    self.config_file,
                 },
                 log_callback=send_log,
                 mode=mode,
                 move_records=move_records,
                 use_ai=use_ai,
+                diversion_rules=diversion_rules,
             )
             # 把整理结果和移动记录一起发送给界面线程。
             self.message_queue.put(
@@ -1581,8 +2404,8 @@ def main() -> None:
     # 使用固定像素布局，保证 125% / 150% 系统缩放下也不裁切右侧控件。
     ctk.deactivate_automatic_dpi_awareness()
 
-    # 创建 customtkinter 主窗口。
-    root = ctk.CTk(fg_color=OrganizerApp.BACKGROUND_COLOR)
+    # 创建同时支持 CustomTkinter 和文件夹拖拽的根窗口。
+    root = DnDCTk(fg_color=OrganizerApp.BACKGROUND_COLOR)
     # 设置窗口左上角图标；找不到图标时继续正常启动程序。
     try:
         root.iconbitmap("app_icon.ico")

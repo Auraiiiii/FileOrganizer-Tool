@@ -4,3 +4,5 @@ openai>=1.0.0
 python-dotenv>=1.0.0
 # 现代浅色桌面界面与圆角控件。
 customtkinter>=5.2.0
+# 原生系统拖拽支持，用于接收资源管理器中的文件夹。
+tkinterdnd2>=0.6.4
