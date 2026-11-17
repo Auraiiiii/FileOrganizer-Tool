@@ -3,10 +3,11 @@
 
 这个程序使用 customtkinter 构建轻量、现代的桌面图形界面。
 它保留下面的整理逻辑：
-1. 只整理所选文件夹顶层的文件，不会递归进入子文件夹。
+1. 递归整理所选文件夹及其所有子文件夹中的文件。
 2. 支持按扩展名分类，以及按文件修改月份归档两种整理方式。
 3. 如果目标文件夹中有同名文件，会自动生成“文件名 (1).扩展名”这样的新名称。
 4. 每次整理都会记录文件的原始路径和目标路径，支持一键撤销最近一次整理。
+5. 递归扫描会跳过分类目录，并在结束后自底向上清理空文件夹。
 """
 
 # 延迟解析类型注解，让较旧版本的 Python 也能正常读取这个文件。
@@ -51,6 +52,10 @@ CATEGORY_RULES = {
     # 压缩包统一移动到 Archives 文件夹。
     "Archives": {".zip", ".rar"},
 }
+
+# 这些目录由整理器创建或接管，递归扫描时不能再次进入，否则可能把刚整理好的
+# 文件重新当作源文件，形成反复套娃。Others 也属于固定目标目录。
+ORGANIZER_DIRECTORY_NAMES = frozenset(CATEGORY_RULES) | frozenset({"Others"})
 
 # 自定义分流沿用了默认分类的扩展名规则，避免两种入口产生不同判断。
 # 每项由界面显示文字和 CATEGORY_RULES 中的内部分类名称组成。
@@ -305,8 +310,8 @@ def get_month_category(file_path: Path) -> str:
 def build_destination(target_directory: Path, file_name: str) -> Path:
     # 先拼接出最直接的目标路径。
     destination = target_directory / file_name
-    # 如果目标位置没有同名文件，就直接使用这个路径。
-    if not destination.exists():
+    # lexists 也会识别失效的符号链接，避免把已有目录项当成空位覆盖。
+    if not os.path.lexists(destination):
         return destination
 
     # 保存原文件名中除扩展名以外的部分。
@@ -320,10 +325,91 @@ def build_destination(target_directory: Path, file_name: str) -> Path:
         # 生成类似“文件名 (1).jpg”的候选路径。
         candidate = destination.with_name(f"{stem} ({index}){suffix}")
         # 如果候选路径没有被占用，就可以安全使用。
-        if not candidate.exists():
+        if not os.path.lexists(candidate):
             return candidate
         # 当前序号已占用，准备检查下一个序号。
         index += 1
+
+
+def is_generated_target_directory_name(directory_name: str) -> bool:
+    """判断目录名是否属于整理器生成的目标目录。"""
+
+    if directory_name in ORGANIZER_DIRECTORY_NAMES:
+        return True
+
+    # 按修改时间归档会创建 YYYY-MM 目录。只匹配这个固定格式，避免把普通
+    # 子文件夹误判为归档目录。
+    return (
+        len(directory_name) == 7
+        and directory_name[4] == "-"
+        and directory_name[:4].isdigit()
+        and directory_name[5:].isdigit()
+    )
+
+
+def path_is_within(path: Path, parent: Path) -> bool:
+    """判断 path 是否与 parent 相同或位于 parent 的文件树中。"""
+
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def remove_empty_subdirectories(
+    source_directory: Path,
+    excluded_directories: set[Path] | None = None,
+    log_callback=None,
+) -> int:
+    """自底向上删除 source_directory 内所有空子文件夹。
+
+    根目录永远不会被删除。无法解析、无权限或仍有内容的文件夹会被保留，
+    并且不会中断其他文件夹的清理。
+    """
+
+    if log_callback is None:
+        log_callback = lambda message: None
+
+    excluded_resolved: set[Path] = set()
+    for excluded_directory in excluded_directories or set():
+        try:
+            excluded_resolved.add(excluded_directory.resolve())
+        except OSError:
+            excluded_resolved.add(excluded_directory.absolute())
+
+    removed_count = 0
+    for current_root, _, _ in os.walk(
+        source_directory,
+        topdown=False,
+        followlinks=False,
+    ):
+        current_path = Path(current_root)
+        # 保留根目录；根目录下的分类目录仍可由下面的空目录检查正常处理。
+        if current_path == source_directory:
+            continue
+        # 不删除符号链接或目录联接，避免越过用户指定范围操作其他位置。
+        if current_path.is_symlink():
+            continue
+
+        try:
+            resolved_path = current_path.resolve()
+            # 自定义分流目标属于用户指定的数据目录，不参与自动清理。
+            if any(
+                path_is_within(resolved_path, excluded)
+                for excluded in excluded_resolved
+            ):
+                continue
+            if not any(current_path.iterdir()):
+                current_path.rmdir()
+                removed_count += 1
+        except OSError as error:
+            # 权限不足或扫描期间出现新文件时保留目录，继续清理其他位置。
+            log_callback(
+                f"空文件夹清理跳过：{current_path}（{error}）"
+            )
+
+    return removed_count
 
 
 # 定义函数，把模型摘要转换成安全、简短且不会覆盖文件的名称。
@@ -380,6 +466,7 @@ def organize_directory(
     move_records: list[MoveRecord] | None = None,
     use_ai: bool = False,
     diversion_rules: list[DiversionRule] | None = None,
+    cleanup_stats: list[int] | None = None,
 ) -> tuple[int, int]:
     """整理指定文件夹，并返回（成功数量，失败数量）。
 
@@ -390,6 +477,8 @@ def organize_directory(
     move_records：用于收集成功移动记录的列表，供“撤销上一步”使用。
     use_ai：为 True 时尝试为 .txt/.md 文件生成 AI 摘要并重命名。
     diversion_rules：按顺序匹配的“文件类型 -> 目标文件夹”规则列表。
+    cleanup_stats：可选结果容器；整理结束后追加本次删除的空文件夹数量。
+        保留现有二元组返回值，避免破坏既有调用方和撤销流程。
     """
 
     # 如果没有提供日志函数，就使用一个什么都不做的小函数。
@@ -468,6 +557,13 @@ def organize_directory(
 
     # 保存需要跳过的文件路径，统一转换成绝对路径，方便比较。
     protected_paths = {path.resolve() for path in (skip_paths or set())}
+    # 自定义分流目标若位于源目录内部，也必须从递归扫描中排除，避免把刚
+    # 分流进去的文件再次扫出来。外部目标不会出现在源目录的遍历结果中。
+    ignored_target_directories: set[Path] = set()
+    for rule in validated_rules:
+        target_directory = rule.target_directory.resolve()
+        if path_is_within(target_directory, source_resolved):
+            ignored_target_directories.add(target_directory)
     # 初始化成功移动的文件数量。
     moved_count = 0
     # 初始化移动失败的文件数量。
@@ -507,11 +603,47 @@ def organize_directory(
                 "本次将按普通方式整理文件。"
             )
 
-    # 先复制一份顶层文件列表再遍历；AI 重命名会改变目录项名称，
-    # 使用快照可以避免边遍历边修改目录造成漏处理文件。
-    for file_path in list(source_directory.iterdir()):
-        # 如果当前项目不是文件，就跳过文件夹、快捷方式等非普通文件。
-        if not file_path.is_file():
+    # 一次生成整棵目录树的文件快照。后续 AI 重命名和移动会改变目录项，
+    # 快照可以保证当前批次不会因边遍历边修改目录而漏掉文件。
+    candidate_files: list[Path] = []
+
+    def handle_walk_error(error: OSError) -> None:
+        log_callback(f"跳过无法扫描的位置：{error}")
+
+    for current_root, directory_names, file_names in os.walk(
+        source_directory,
+        topdown=True,
+        onerror=handle_walk_error,
+        followlinks=False,
+    ):
+        current_directory = Path(current_root)
+        retained_directory_names: list[str] = []
+        for directory_name in directory_names:
+            child_directory = current_directory / directory_name
+            # 整理器只在源目录根层生成分类目录和月份归档目录。只剪枝这些
+            # 真实目标，既能防止无限套娃，也不会漏掉普通子文件夹里的同名目录。
+            if (
+                current_directory == source_directory
+                and is_generated_target_directory_name(directory_name)
+            ):
+                continue
+            try:
+                resolved_child = child_directory.resolve()
+            except OSError:
+                retained_directory_names.append(directory_name)
+                continue
+            if resolved_child in ignored_target_directories:
+                continue
+            retained_directory_names.append(directory_name)
+        directory_names[:] = retained_directory_names
+
+        for file_name in file_names:
+            candidate_files.append(current_directory / file_name)
+
+    for file_path in candidate_files:
+        # os.walk 返回的名字通常都是文件；这里仍兼容扫描后目录项发生变化
+        # 的情况，并且不跟随符号链接。
+        if not file_path.is_file() or file_path.is_symlink():
             continue
 
         # 读取文件的绝对路径；个别特殊文件可能无法读取，此时直接跳过。
@@ -560,9 +692,9 @@ def organize_directory(
                         summary = summarize_text(preview)
                         # 把模型摘要清洗成安全的文件名。
                         ai_file_name = build_ai_file_name(summary, current_path)
-                        # 在原文件夹中处理重名冲突，确保不会覆盖已有文件。
+                        # 在文件所在子文件夹中处理重名冲突，确保不会覆盖。
                         ai_renamed_path = build_destination(
-                            source_directory,
+                            current_path.parent,
                             ai_file_name,
                         )
                         # 按需求先在原位置重命名，再进入统一的分类移动流程。
@@ -653,7 +785,7 @@ def organize_directory(
     if use_ai:
         if ai_eligible_count == 0:
             log_callback(
-                "AI 重命名未执行：所选文件夹顶层没有 .txt 或 .md 文件。"
+                "AI 重命名未执行：所选文件夹及其子文件夹中没有 .txt 或 .md 文件。"
             )
         log_callback(
             f"AI 重命名统计：符合条件的文件 {ai_eligible_count} 个，"
@@ -661,9 +793,23 @@ def organize_directory(
             f"失败 {ai_failure_count} 个。"
         )
 
-    # 所有文件处理完成后，输出简短的结果摘要。
+    # 所有文件处理完成后，自底向上清理空目录。根目录本身不会被删除，
+    # 位于源目录内的自定义分流目标也不会被自动清理。
+    empty_folder_count = remove_empty_subdirectories(
+        source_directory,
+        excluded_directories=ignored_target_directories,
+        log_callback=log_callback,
+    )
+    if cleanup_stats is not None:
+        cleanup_stats.append(empty_folder_count)
+
+    # 输出移动统计和用户要求的深度扫描完成提示。
     log_callback(
         f"整理完成：成功移动了 {moved_count} 个文件，失败 {failed_count} 个文件。"
+    )
+    log_callback(
+        "✅ 扫描完成：已包含所有子文件夹深度清理，"
+        f"清理了 {empty_folder_count} 个空文件夹"
     )
     # 把统计结果返回给界面，用于更新按钮状态和弹窗提示。
     return moved_count, failed_count
@@ -2157,6 +2303,8 @@ class OrganizerApp:
 
         # 创建本次整理的移动记录列表，成功移动一个就追加一条。
         move_records: list[MoveRecord] = []
+        # 业务函数保持原二元组返回值；这个列表只传递空文件夹清理统计。
+        cleanup_stats: list[int] = []
 
         # 使用异常处理，防止意外错误导致界面一直停在“正在整理”。
         try:
@@ -2178,10 +2326,18 @@ class OrganizerApp:
                 move_records=move_records,
                 use_ai=use_ai,
                 diversion_rules=diversion_rules,
+                cleanup_stats=cleanup_stats,
             )
+            empty_folder_count = cleanup_stats[0] if cleanup_stats else 0
             # 把整理结果和移动记录一起发送给界面线程。
             self.message_queue.put(
-                ("done", moved_count, failed_count, move_records)
+                (
+                    "done",
+                    moved_count,
+                    failed_count,
+                    move_records,
+                    empty_folder_count,
+                )
             )
         except Exception as error:
             # 即使发生意外错误，也把已经成功移动的记录带回界面，保证还能撤销。
@@ -2249,7 +2405,12 @@ class OrganizerApp:
                 self._append_log(message[1])
             # 如果是整理完成消息，就恢复按钮状态并显示结果。
             elif message[0] == "done":
-                self._finish_organizing(message[1], message[2], message[3])
+                self._finish_organizing(
+                    message[1],
+                    message[2],
+                    message[3],
+                    message[4],
+                )
                 return
             # 如果是撤销完成消息，就显示撤销结果。
             elif message[0] == "undo_done":
@@ -2273,6 +2434,7 @@ class OrganizerApp:
         moved_count: int,
         failed_count: int,
         move_records: list[MoveRecord],
+        empty_folder_count: int = 0,
     ) -> None:
         """整理结束后恢复界面，并告诉用户最终结果。"""
 
@@ -2291,14 +2453,23 @@ class OrganizerApp:
         # 根据最新记录更新撤销按钮。
         self._update_undo_button()
 
+        cleanup_message = (
+            "✅ 扫描完成：已包含所有子文件夹深度清理，"
+            f"清理了 {empty_folder_count} 个空文件夹"
+        )
+
         # 如果没有任何文件被移动或失败，说明文件夹中没有可整理的文件。
         if moved_count == 0 and failed_count == 0:
-            messagebox.showinfo("整理完成", "没有找到需要整理的文件。")
+            messagebox.showinfo(
+                "整理完成",
+                f"没有找到需要整理的文件。\n\n{cleanup_message}",
+            )
         # 如果没有失败文件，就显示成功移动的数量。
         elif failed_count == 0:
             messagebox.showinfo(
                 "整理完成",
                 f"成功移动了 {moved_count} 个文件。\n\n"
+                f"{cleanup_message}\n\n"
                 "如需恢复，可点击“撤销上一步”。",
             )
         # 如果有失败文件，就同时显示成功和失败的数量。
@@ -2307,6 +2478,7 @@ class OrganizerApp:
                 "整理完成（部分文件失败）",
                 f"成功移动了 {moved_count} 个文件，"
                 f"有 {failed_count} 个文件移动失败。\n\n"
+                f"{cleanup_message}\n\n"
                 "请查看日志中的详细原因。",
             )
 

@@ -1,3 +1,4 @@
+import os
 # 导入 shutil 模块，用来移动文件。
 import shutil
 # 从 pathlib 模块导入 Path，用来更方便地处理文件路径。
@@ -21,6 +22,9 @@ CATEGORY_RULES = {
     "Archives": {".zip", ".rar"},
 }
 
+# 整理器创建的目标目录在递归扫描时必须跳过，避免重复整理已归档文件。
+ORGANIZER_DIRECTORY_NAMES = frozenset(CATEGORY_RULES) | frozenset({"Others"})
+
 
 # 定义函数，根据文件扩展名返回文件所属的分类名称。
 def get_category(file_path: Path) -> str:
@@ -40,8 +44,8 @@ def get_category(file_path: Path) -> str:
 def build_destination(target_directory: Path, file_name: str) -> Path:
     # 先拼接出最直接的目标路径。
     destination = target_directory / file_name
-    # 如果目标位置没有同名文件，就直接使用这个路径。
-    if not destination.exists():
+    # lexists 也能识别失效的符号链接，避免覆盖任何已有目录项。
+    if not os.path.lexists(destination):
         # 返回可以直接使用的目标路径。
         return destination
     # 保存原文件名中除扩展名以外的部分。
@@ -55,11 +59,33 @@ def build_destination(target_directory: Path, file_name: str) -> Path:
         # 生成类似“文件名 (1).jpg”的候选路径。
         candidate = destination.with_name(f"{stem} ({index}){suffix}")
         # 如果候选路径没有被占用，就可以安全使用。
-        if not candidate.exists():
+        if not os.path.lexists(candidate):
             # 返回可用的候选路径。
             return candidate
         # 当前序号已占用，准备检查下一个序号。
         index += 1
+
+
+def remove_empty_subdirectories(source_directory: Path) -> int:
+    """自底向上删除空子文件夹，永远保留 source_directory 本身。"""
+
+    removed_count = 0
+    for current_root, _, _ in os.walk(
+        source_directory,
+        topdown=False,
+        followlinks=False,
+    ):
+        current_path = Path(current_root)
+        if current_path == source_directory or current_path.is_symlink():
+            continue
+        try:
+            if not any(current_path.iterdir()):
+                current_path.rmdir()
+                removed_count += 1
+        except OSError:
+            # 权限不足或清理期间出现新文件时保留目录，继续处理其他文件夹。
+            continue
+    return removed_count
 
 
 # 定义主函数，完成遍历、分类和移动文件的操作。
@@ -70,11 +96,32 @@ def organize_current_directory() -> None:
     failed_count = 0
     # 获取当前脚本自身的绝对路径，避免整理时把脚本自己移走。
     current_script = Path(__file__).resolve()
-    # 遍历当前工作目录中的每一个项目。
-    for file_path in SOURCE_DIRECTORY.iterdir():
-        # 如果当前项目不是文件，就跳过目录、快捷方式等非普通文件。
-        if not file_path.is_file():
-            # 继续检查下一个项目。
+    # 先为整棵目录树创建文件快照，避免移动文件时影响正在进行的遍历。
+    candidate_files: list[Path] = []
+    for current_root, directory_names, file_names in os.walk(
+        SOURCE_DIRECTORY,
+        topdown=True,
+        followlinks=False,
+    ):
+        current_directory = Path(current_root)
+        # 原地过滤源目录根层的目标目录，os.walk 就不会进入整理器生成的
+        # 归档位置；普通子文件夹中恰好同名的目录仍会正常扫描。
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if not (
+                current_directory == SOURCE_DIRECTORY
+                and name in ORGANIZER_DIRECTORY_NAMES
+            )
+        ]
+        candidate_files.extend(
+            current_directory / file_name for file_name in file_names
+        )
+
+    # 逐一整理快照中的全部文件，包括所有层级子文件夹中的文件。
+    for file_path in candidate_files:
+        # 不跟随符号链接，避免把链接目标误当普通文件移动。
+        if not file_path.is_file() or file_path.is_symlink():
             continue
         # 如果当前项目就是本脚本，就跳过它，保证程序文件留在原处。
         if file_path.resolve() == current_script:
@@ -102,8 +149,15 @@ def organize_current_directory() -> None:
             print(f"移动失败：{file_path.name}（{error}）")
             # 移动失败后，把失败数量加一。
             failed_count += 1
+    # 所有文件处理完成后，自底向上清理空子文件夹。
+    empty_folder_count = remove_empty_subdirectories(SOURCE_DIRECTORY)
+
     # 所有文件处理完成后，输出简短的结果摘要。
     print(f"整理完成：成功移动 {moved_count} 个文件，失败 {failed_count} 个文件。")
+    print(
+        "[OK] 扫描完成：已包含所有子文件夹深度清理，"
+        f"清理了 {empty_folder_count} 个空文件夹"
+    )
 
 
 # 只有直接运行这个脚本时才执行整理，作为模块导入时不会自动移动文件。
